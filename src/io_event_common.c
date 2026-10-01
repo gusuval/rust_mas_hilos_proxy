@@ -32,22 +32,17 @@ static void free_mem(io_loop_t *l)
     free(l);
 }
 
+static void run_defers(io_loop_t *l);
+
 void io_loop_destroy(io_loop_t *l)
 {
     if (!l)
         return;
+    /* Un hilo worker puede terminar sin que termine el proceso: se
+     * ejecutan las liberaciones diferidas que queden pendientes. */
+    while (l->ndefer)
+        run_defers(l);
     io_backend_close(l);
-    free_mem(l);
-}
-
-void io_loop_abandon(io_loop_t *l)
-{
-    if (!l)
-        return;
-    /* Cerrar solo nuestro descriptor: nada de EPOLL_CTL_DEL, que alteraría
-     * la instancia compartida con el proceso padre. */
-    if (l->fd >= 0)
-        close(l->fd);
     free_mem(l);
 }
 

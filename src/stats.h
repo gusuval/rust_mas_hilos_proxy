@@ -2,12 +2,14 @@
 #define STATS_H
 
 /*
- * Estadísticas en memoria compartida (mmap MAP_SHARED creada por el master
- * antes del fork). Cada worker escribe solo en su slot: contadores atómicos
- * y una tabla de servidores publicada periódicamente con un seqlock. El
- * master agrega y sirve JSON por un socket UNIX.
+ * Estadísticas compartidas entre los hilos del proceso. Cada hilo worker
+ * escribe solo en su slot (alineado a línea de caché para evitar false
+ * sharing): contadores atómicos y una tabla de servidores que publica cada
+ * 250 ms bajo el mutex del slot. El hilo master agrega y sirve JSON por un
+ * socket UNIX.
  */
 
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -31,7 +33,7 @@ typedef struct {
 enum { ST_1XX, ST_2XX, ST_3XX, ST_4XX, ST_5XX, ST_NCLASS };
 
 typedef struct {
-    _Alignas(64) atomic_int pid;
+    _Alignas(64) atomic_int alive; /* 1 mientras el hilo worker corre */
     atomic_uint_fast64_t requests;
     atomic_uint_fast64_t accepted;
     atomic_int_fast64_t active_conns;
@@ -40,10 +42,9 @@ typedef struct {
     atomic_uint_fast64_t upstream_reuses;
     atomic_uint_fast64_t upstream_retries;
     atomic_uint_fast64_t reloads;
-    atomic_uint_fast64_t log_dropped;
     atomic_uint_fast64_t resp[ST_NCLASS];
     atomic_uint_fast64_t buffers_in_use;
-    atomic_uint seq;
+    pthread_mutex_t mu; /* protege nservers y servers */
     int nservers;
     stats_server_t servers[STATS_MAX_SERVERS];
 } stats_worker_t;
@@ -66,7 +67,7 @@ static inline void stat_inc(atomic_uint_fast64_t *c)
     atomic_fetch_add_explicit(c, 1, memory_order_relaxed);
 }
 
-/* Publicación con seqlock desde el worker. */
+/* Publicación de la tabla de servidores desde el worker (toma el mutex). */
 void stats_publish_begin(stats_worker_t *w);
 void stats_publish_end(stats_worker_t *w);
 

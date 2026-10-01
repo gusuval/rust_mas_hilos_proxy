@@ -46,9 +46,8 @@ int io_loop_del(io_loop_t *l, int fd);
 /* Ejecuta hasta io_loop_stop(). Devuelve 0 o -1 en error fatal. */
 int io_loop_run(io_loop_t *l);
 void io_loop_stop(io_loop_t *l);
+/* Ejecuta los callbacks diferidos pendientes y libera el loop. */
 void io_loop_destroy(io_loop_t *l);
-/* Tras fork(): libera memoria sin tocar el estado del kernel compartido. */
-void io_loop_abandon(io_loop_t *l);
 
 /* Reloj monótono cacheado por iteración (ms). */
 uint64_t io_loop_now(const io_loop_t *l);

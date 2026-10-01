@@ -8,7 +8,7 @@ Con este proyecto el alumno aprende:
 
 - **I/O no bloqueante y event loops**: cómo un solo hilo atiende miles de conexiones (el modelo de nginx y Node.js por dentro).
 - La diferencia entre `epoll` (Linux) y `kqueue` (macOS/BSD) y cómo abstraerlas tras una API común.
-- Multiproceso con **`SO_REUSEPORT`** (un worker por CPU), balanceo round-robin/weighted/least-conn/least-load y health checks.
+- Multihilo con **`pthread`** y **`SO_REUSEPORT`** (un hilo worker con su event loop por CPU), balanceo round-robin/weighted/least-conn/least-load y health checks.
 - Terminación **TLS** con OpenSSL y selección de certificado por **SNI**.
 - Build con **Meson**, tests unitarios con **cmocka** y benchmarking con **wrk**.
 
@@ -21,7 +21,8 @@ Client ──► [Frontend :8080 HTTP / :8443 TLS+SNI] ──► parse HTTP Host
         ──► respuesta ──► keep-alive / pipelining / túnel WebSocket
 ```
 
-- **Master + N workers** (`workers = "auto"` → nº de CPUs). El master valida la config, vigila el fichero, relanza workers caídos y sirve las estadísticas; cada worker tiene **un event-loop** no bloqueante y edge-triggered (`EPOLLET` / `EV_CLEAR`), más un hilo de health checks y otro de log.
+- **Un proceso: hilo master + N hilos worker** (`pthread`, `workers = "auto"` → nº de CPUs). El hilo master valida la config, vigila el fichero, atiende las señales, relanza un worker cuyo hilo termina y sirve las estadísticas. Cada worker tiene **un event-loop** no bloqueante y edge-triggered (`EPOLLET` / `EV_CLEAR`) y un hilo de health checks; hay un único hilo de log para todo el proceso.
+- El estado de cada worker es `_Thread_local` (el código del event loop sigue siendo monohilo y sin locks). Master y workers solo se comunican por un `socketpair` por worker (config, parada), y las estadísticas van a slots por hilo con atómicos y un mutex.
 - En Linux cada worker abre sus sockets con `SO_REUSEPORT` y el kernel reparte las conexiones. En macOS/BSD, donde `SO_REUSEPORT` no reparte carga, el master abre los sockets y los pasa a los workers (`SCM_RIGHTS`).
 - Capa de abstracción `io_event.[ch]` con la misma API sobre epoll y kqueue.
 - Configuración en **TOML** (frontends, rutas por dominio, backends con pesos) con **recarga en caliente automática** (vigilancia del fichero con inotify/kqueue) **y vía SIGHUP**.
@@ -31,9 +32,9 @@ Client ──► [Frontend :8080 HTTP / :8443 TLS+SNI] ──► parse HTTP Host
 | Módulo | Responsabilidad |
 |--------|-----------------|
 | `io_event` | Abstracción epoll/kqueue (`io_loop_create/add/mod/del/run/stop`), timers (min-heap perezoso) y callbacks diferidos |
-| `master` | Arranque y relanzamiento de workers, recarga (fichero + SIGHUP), socket de estadísticas |
-| `worker` | Event loop del worker, accept, swap de generaciones de config, parada ordenada |
-| `listener` | Sockets de escucha (`SO_REUSEPORT`) y canal master→worker con paso de fds |
+| `master` | Lanzamiento (`pthread_create`), join y relanzamiento de hilos worker, señales, recarga (fichero + SIGHUP), socket de estadísticas |
+| `worker` | Cuerpo del hilo worker: event loop, accept, swap de generaciones de config, parada ordenada |
+| `listener` | Sockets de escucha (`SO_REUSEPORT`) y canal master→worker (`socketpair`) con paso de fds |
 | `runtime` | Generación de config "compilada" (routers, TLS, backends) con refcount (RCU) |
 | `tls` | Terminación TLS (OpenSSL), selección de certificado por SNI |
 | `connection` | Máquina de estados cliente↔upstream, arena de conexiones |
@@ -45,7 +46,7 @@ Client ──► [Frontend :8080 HTTP / :8443 TLS+SNI] ──► parse HTTP Host
 | `watch` | Vigilancia del fichero de config: inotify (Linux) / `EVFILT_VNODE` (kqueue) |
 | `log` | Ring buffer 4096×512B con hilo consumidor |
 | `buffer_pool` | Arena `mmap` de slots de 16 KB con freelist |
-| `stats` | Memoria compartida entre procesos (contadores atómicos + seqlock) y JSON agregado por socket UNIX |
+| `stats` | Slot por hilo worker (contadores atómicos + tabla de servidores bajo mutex) y JSON agregado por socket UNIX |
 
 Herramientas de prueba (`tools/`): `test_backend` (backend HTTP/1.1 + WebSocket sobre la misma `io_event`) y `ws_probe` (cliente WebSocket en C, con TLS).
 
@@ -102,6 +103,17 @@ Meta **superada en los tres escenarios HTTPS** (entre 3,4× y 4,5×), con 0 erro
 
 wrk, proxy y backends comparten máquina, así que las cifras son una cota inferior de lo que da el proxy solo. Informe completo: [`bench/results/bench-20260926-194903.md`](bench/results/bench-20260926-194903.md).
 
+**Workers con hilos (`pthread`) frente a procesos (`fork`)**, en la misma máquina y con dos ejecuciones alternas de cada versión ([comparativa](bench/results/comparativa-fork-pthread-20261001.md)):
+
+| Escenario | fork | pthread |
+|---|---|---|
+| HTTPS `-c100` | 218k / 228k | 225k / 229k |
+| HTTPS `-c200` | 201k / 220k | 220k / 206k |
+| HTTPS `-c400` | 27k ⚠️ / 174k | 168k / 174k |
+| HTTP `-c200` | 298k / 317k | 336k / 339k |
+
+En HTTPS el rendimiento es equivalente (las diferencias son del tamaño del ruido entre ejecuciones). En HTTP la versión con hilos sale un 6-13 % por encima. ⚠️ Ejecución puntual de la versión fork en la que wrk acabó con 400 timeouts; no se reprodujo.
+
 ## 🚀 Cómo ejecutar
 
 Requisitos: compilador C11, Meson ≥ 0.60, Ninja, OpenSSL ≥ 3.0 y cmocka. Para los tests y el benchmark: curl, jq, socat y wrk. En Ubuntu:
@@ -117,13 +129,17 @@ meson setup build && meson compile -C build
 # Tests unitarios (5 suites cmocka)
 meson test -C build --suite unit
 
-# Tests de integración (96 comprobaciones: genera config y certificados,
+# Tests de integración (99 comprobaciones: genera config y certificados,
 # lanza 12 backends y el proxy, y limpia al terminar)
 ./tests/integration/run.sh
 
 # Todo con AddressSanitizer + UBSan
 meson setup build-asan -Db_sanitize=address,undefined -Db_lundef=false
 meson test -C build-asan --suite unit && ./tests/integration/run.sh build-asan
+
+# Carreras entre hilos con ThreadSanitizer (KEEP_WORK=1 conserva proxy.stderr)
+meson setup build-tsan -Db_sanitize=thread -Db_lundef=false && meson compile -C build-tsan
+KEEP_WORK=1 ./tests/integration/run.sh build-tsan
 
 # Demo con certificados de prueba
 ./tests/gen_config.sh demo
@@ -140,7 +156,7 @@ sudo ./tests/hosts.sh add
 ./build/src/proxy -c proxy.toml
 
 # Recargar configuración: basta con guardar proxy.toml, o bien
-kill -HUP <pid-master>
+kill -HUP <pid-proxy>
 
 # Estadísticas
 nc -U /tmp/proxy.sock

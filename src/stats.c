@@ -1,4 +1,5 @@
 #include "stats.h"
+#include "log.h"
 #include "util.h"
 
 #include <stdarg.h>
@@ -15,7 +16,7 @@ static size_t shm_size(int nworkers)
 stats_shm_t *stats_create(int nworkers)
 {
     size_t sz = shm_size(nworkers);
-    void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+    void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (m == MAP_FAILED)
         return NULL;
     memset(m, 0, sz);
@@ -23,26 +24,23 @@ stats_shm_t *stats_create(int nworkers)
     s->nworkers = nworkers;
     s->start_wall_ms = wall_ms();
     s->start_mono_ms = mono_ms();
+    for (int i = 0; i < nworkers; i++)
+        pthread_mutex_init(&s->w[i].mu, NULL);
     return s;
 }
 
 void stats_destroy(stats_shm_t *s)
 {
-    if (s)
-        munmap(s, shm_size(s->nworkers));
+    if (!s)
+        return;
+    for (int i = 0; i < s->nworkers; i++)
+        pthread_mutex_destroy(&s->w[i].mu);
+    munmap(s, shm_size(s->nworkers));
 }
 
-void stats_publish_begin(stats_worker_t *w)
-{
-    atomic_fetch_add_explicit(&w->seq, 1, memory_order_relaxed);
-    atomic_thread_fence(memory_order_release);
-}
+void stats_publish_begin(stats_worker_t *w) { pthread_mutex_lock(&w->mu); }
 
-void stats_publish_end(stats_worker_t *w)
-{
-    atomic_thread_fence(memory_order_release);
-    atomic_fetch_add_explicit(&w->seq, 1, memory_order_relaxed);
-}
+void stats_publish_end(stats_worker_t *w) { pthread_mutex_unlock(&w->mu); }
 
 typedef struct {
     char *p;
@@ -83,19 +81,13 @@ typedef struct {
 /* Copia consistente de la tabla de servidores de un worker. */
 static int snapshot(stats_worker_t *w, stats_server_t *out)
 {
-    for (int tries = 0; tries < 100; tries++) {
-        unsigned s1 = atomic_load_explicit(&w->seq, memory_order_acquire);
-        if (s1 & 1u)
-            continue;
-        int n = w->nservers;
-        if (n < 0 || n > STATS_MAX_SERVERS)
-            n = 0;
-        memcpy(out, w->servers, (size_t)n * sizeof(stats_server_t));
-        atomic_thread_fence(memory_order_acquire);
-        if (atomic_load_explicit(&w->seq, memory_order_relaxed) == s1)
-            return n;
-    }
-    return 0;
+    pthread_mutex_lock(&w->mu);
+    int n = w->nservers;
+    if (n < 0 || n > STATS_MAX_SERVERS)
+        n = 0;
+    memcpy(out, w->servers, (size_t)n * sizeof(stats_server_t));
+    pthread_mutex_unlock(&w->mu);
+    return n;
 }
 
 char *stats_json(stats_shm_t *s, size_t *len)
@@ -113,7 +105,7 @@ char *stats_json(stats_shm_t *s, size_t *len)
 
     for (int i = 0; i < s->nworkers; i++) {
         stats_worker_t *w = &s->w[i];
-        if (atomic_load(&w->pid) > 0)
+        if (atomic_load(&w->alive))
             alive++;
         tot_req += atomic_load(&w->requests);
         acc += atomic_load(&w->accepted);
@@ -122,11 +114,10 @@ char *stats_json(stats_shm_t *s, size_t *len)
         uc += atomic_load(&w->upstream_connects);
         ur += atomic_load(&w->upstream_reuses);
         retr += atomic_load(&w->upstream_retries);
-        drop += atomic_load(&w->log_dropped);
         bufs += atomic_load(&w->buffers_in_use);
         for (int c = 0; c < ST_NCLASS; c++)
             resp[c] += atomic_load(&w->resp[c]);
-        if (!agg || !tmp || atomic_load(&w->pid) <= 0)
+        if (!agg || !tmp || !atomic_load(&w->alive))
             continue;
         int n = snapshot(w, tmp);
         for (int k = 0; k < n; k++) {
@@ -157,6 +148,7 @@ char *stats_json(stats_shm_t *s, size_t *len)
         }
     }
 
+    drop = log_dropped(); /* un único logger para todo el proceso */
     uint64_t up_ms = mono_ms() - s->start_mono_ms;
     sb_printf(&b,
               "{\"uptime_s\":%.1f,\"workers\":%d,\"workers_alive\":%d,"

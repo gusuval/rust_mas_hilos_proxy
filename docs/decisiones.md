@@ -2,13 +2,22 @@
 
 Cada decisión con la alternativa descartada y el motivo.
 
-## Procesos y event loop
+## Hilos y event loop
 
-**Master + N workers, un hilo de event loop por worker.**
-Alternativa: un proceso con N hilos de event loop. Con procesos, un fallo de memoria en un worker no tumba el proxy (el master lo relanza) y no hay que sincronizar nada entre loops. Lo que sí se comparte (estadísticas) va por una región `mmap` con contadores atómicos.
+**Un proceso con un hilo master + N hilos worker (`pthread`), un event loop por hilo.**
+Alternativa (la versión anterior): master + N procesos worker con `fork()`. Con procesos, un fallo de memoria en un worker no tumba el proxy, porque el master lo relanza. Con hilos, un `SIGSEGV` en un worker termina todo el proceso. A cambio, hay un solo proceso que gestionar (un PID, un `kill -HUP`), un único hilo de log, sin región `mmap` compartida ni `SIGCHLD`/`waitpid`, y menos memoria (un espacio de direcciones). En el benchmark el rendimiento HTTPS es el mismo y en HTTP es algo mayor ([comparativa](../bench/results/comparativa-fork-pthread-20261001.md)).
 
-**`SO_REUSEPORT` por worker en Linux; sockets heredados del master en macOS/BSD.**
-En Linux el kernel reparte las conexiones entre los sockets del grupo, sin *thundering herd*. En macOS `SO_REUSEPORT` permite el bind, pero no reparte: entrega las conexiones a un único socket. Allí el master abre los sockets y los pasa a los workers por el canal (`SCM_RIGHTS`), también en las recargas que añaden frontends.
+Para que el código del event loop siga siendo monohilo y sin locks:
+
+- El estado de cada worker (`W`, la arena de sesiones, los handlers del canal) es `_Thread_local`. `connection.c`, los timers y el buffer pool no han cambiado: cada hilo tiene los suyos.
+- Master y worker solo se hablan por un `socketpair` por worker: config (`CHAN_CONFIG`) y parada (`CHAN_STOP`). El master detecta que un hilo ha terminado por el EOF de su extremo: es el equivalente a `SIGCHLD`. Entonces hace `pthread_join` y lo relanza con el mismo backoff que antes.
+- Las señales solo las atiende el hilo master. Los workers se crean con todas las señales bloqueadas (`pthread_sigmask`), y los hilos de health checks heredan esa máscara.
+- Estadísticas: cada worker escribe en su slot (alineado a 64 B, contra el *false sharing*). Los contadores son atómicos. La tabla de servidores se publica bajo un `pthread_mutex` por slot, en lugar del seqlock anterior: entre hilos, las lecturas no atómicas del seqlock son una carrera de datos (ThreadSanitizer la detectaba), y con una publicación cada 250 ms el mutex no cuesta nada.
+- Un hilo puede terminar sin que termine el proceso, así que al salir libera lo que antes liberaba el `exit()`: `io_loop_destroy` ejecuta las liberaciones diferidas pendientes, y luego se liberan la arena de sesiones y el buffer pool.
+- La batería de integración se ejecuta también con ThreadSanitizer (`build-tsan`), además de con ASan+UBSan.
+
+**`SO_REUSEPORT` por worker en Linux; sockets del master en macOS/BSD.**
+En Linux el kernel reparte las conexiones entre los sockets del grupo, sin *thundering herd*; esto funciona igual con hilos que con procesos. En macOS `SO_REUSEPORT` permite el bind, pero no reparte: entrega las conexiones a un único socket. Allí el master abre los sockets y los pasa a los workers por el canal (`SCM_RIGHTS`, que dentro del mismo proceso entrega un duplicado del descriptor), también en las recargas que añaden frontends.
 
 **Edge-triggered, cada fd registrado una sola vez con lectura+escritura.**
 Alternativa: level-triggered, o edge-triggered activando `EPOLLOUT` solo cuando hace falta. Registrar una vez y llevar dos flags por fd (`rd`/`wr`: "el último intento no dio EAGAIN") evita un `epoll_ctl(MOD)` por cambio de estado. `sess_drive()` repite leer → procesar → escribir mientras haya progreso. Así nunca queda trabajo pendiente sin un evento que lo despierte, que es el error típico con ET. Una sesión que agota su presupuesto (32 vueltas) se replanifica al final de la iteración para no acaparar el loop.
@@ -48,7 +57,7 @@ Se rechazan `Content-Length` + `Transfer-Encoding`, varios `Content-Length` dist
 La carga llega en `X-Backend-Load` con cada respuesta, se suaviza con una media móvil (α = 0,3) y caduca a los 5 s. Elegir siempre el mínimo haría que todos los workers se lanzaran a la vez sobre el mismo servidor entre dos actualizaciones. Con P2C (dos candidatos al azar, gana el de menos carga) se reparte mejor y sigue favoreciendo al menos cargado. Si la carga es desconocida o hay empate, decide `least_conn`. Con empate también en conexiones, gana el servidor sin carga fresca: así se conoce su carga cuanto antes. Con el desempate aleatorio inicial, un test de integración resultó inestable (35/40 en vez de ≥ 38).
 
 **Estado de salud por worker.**
-Cada worker tiene su hilo de sondas, sin compartir estado con los demás. Es más simple y no hay locks entre procesos, a cambio de multiplicar las sondas por el número de workers. Las estadísticas muestran `up_workers` y un estado `degraded` si los workers discrepan.
+Cada worker tiene su hilo de sondas, sin compartir estado con los demás. Es más simple y no hay locks entre workers, a cambio de multiplicar las sondas por el número de workers. Las estadísticas muestran `up_workers` y un estado `degraded` si los workers discrepan.
 
 **Recuperación pasiva half-open.**
 Sin health activo, un servidor caído vuelve a probarse pasado `interval`. Si falla otra vez, cae con un solo fallo, sin esperar otros `fall`.

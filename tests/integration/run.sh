@@ -169,12 +169,9 @@ got=$(tls api.test /echo --data-binary @"$WORK/10m.bin" | sha256sum | cut -d' ' 
 check "POST 10 MB por TLS íntegro"            eq "$got" "$want"
 bufs=$(stat .buffers_in_use)
 check "buffers liberados tras las subidas (<= 16)" ge 16 "$bufs"
-maxrss=0
-for pid in $(pgrep -P "$PROXY_PID"); do
-    r=$(awk '/VmHWM/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)
-    ((r > maxrss)) && maxrss=$r
-done
-check "memoria acotada: pico RSS por worker < 64 MB (${maxrss} kB)" ge 65536 "$maxrss"
+# workers = hilos de un único proceso: se mide el pico de todo el proceso
+maxrss=$(awk '/VmHWM/{print $2}' "/proc/$PROXY_PID/status" 2>/dev/null || echo 0)
+check "memoria acotada: pico RSS del proceso < ${WORKERS:-2} x 64 MB (${maxrss} kB)" ge $((65536 * ${WORKERS:-2})) "$maxrss"
 check "respuesta chunked"                     eq "$(req x.example.com /chunked | od -c | head -2)" "$(printf 'hello from web-1\n' | od -c | head -2)"
 out=$(raw $HTTP 'GET /chunked HTTP/1.1\r\nHost: x.example.com\r\nConnection: close\r\n\r\n')
 check "chunked reenviado con trailers"        contains "$out" "X-Trailer: yes"
@@ -318,13 +315,11 @@ check "stats: campos principales"             bash -c 'jq -e ".uptime_s and .req
 check "stats: agregado de ${WORKERS:-2} workers" eq "$(jq .workers_alive <<<"$js")" 2
 check "access log con campos"                 grep -qE '\[access\] \[w[0-9]+\] 127\.0\.0\.1 api\.test "GET /" 200 127\.0\.0\.1:[0-9]+ [0-9]+ms' "$WORK/proxy.log"
 
-section "procesos (RF-03)"
-w=$(pgrep -P "$PROXY_PID" | head -1)
-kill -9 "$w"
-check "worker muerto es relanzado"            wait_until 3 bash -c "(( \$(socat - UNIX-CONNECT:$WORK/proxy.sock | jq .worker_restarts) >= 1 && \$(socat - UNIX-CONNECT:$WORK/proxy.sock | jq .workers_alive) == 2 ))"
-errs=0
-for i in $(seq 20); do [[ $(code api.test /) == 200 ]] || errs=$((errs + 1)); done
-check "tráfico normal tras relanzar el worker" eq "$errs" 0
+section "hilos (RF-03)"
+check "workers como hilos: sin procesos hijos" eq "$(pgrep -P "$PROXY_PID" | wc -l)" 0
+wthreads=$(cat /proc/"$PROXY_PID"/task/*/comm 2>/dev/null | grep -c '^proxy-w[0-9]')
+check "un hilo proxy-wN por worker ($wthreads)" eq "$wthreads" "${WORKERS:-2}"
+check "stats: ningún worker relanzado"        eq "$(stat .worker_restarts)" 0
 
 if command -v wrk >/dev/null; then
     section "carga + recargas sin errores (RNF-03)"
@@ -336,11 +331,12 @@ if command -v wrk >/dev/null; then
 fi
 
 section "parada ordenada"
-WPIDS=$(pgrep -P "$PROXY_PID" | tr '\n' ' ')
 kill -TERM "$PROXY_PID"
 check "SIGTERM: el proxy termina"             wait_until 12 bash -c "! kill -0 $PROXY_PID 2>/dev/null"
 wait "$PROXY_PID" 2>/dev/null
-check "SIGTERM: sin workers huérfanos ($WPIDS)" bash -c 'for p in $1; do kill -0 $p 2>/dev/null && exit 1; done; exit 0' _ "$WPIDS"
+check "SIGTERM: código de salida 0"           eq "$?" 0
+check "SIGTERM: parada ordenada de cada worker" eq "$(grep -c 'worker [0-9]* terminado' "$WORK/proxy.log")" "${WORKERS:-2}"
+check "SIGTERM: sin salida forzada"           not_contains "$(cat "$WORK/proxy.log")" "salida forzada"
 check "SIGTERM: socket de stats eliminado"    test ! -S "$WORK/proxy.sock"
 PROXY_PID=
 

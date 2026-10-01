@@ -27,6 +27,7 @@ struct health {
     pthread_cond_t cv;
     bool stop;
     atomic_bool done;
+    char tag[16]; /* etiqueta de log del worker dueño */
 };
 
 static int wait_fd(int fd, short ev, int timeout_ms)
@@ -89,6 +90,14 @@ out:
 static void *run(void *arg)
 {
     health_t *h = arg;
+    log_set_thread_tag(h->tag);
+    char name[16];
+    snprintf(name, sizeof(name), "proxy-h%.8s", h->tag);
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), name);
+#elif defined(__APPLE__)
+    pthread_setname_np(name);
+#endif
     pthread_mutex_lock(&h->mu);
     while (!h->stop) {
         uint64_t now = mono_ms();
@@ -151,6 +160,7 @@ health_t *health_start(backend_t *bes, int nbe)
         for (int j = 0; j < bes[i].nservers; j++)
             h->t[h->n++] = (target_t){.be = &bes[i], .srv = &bes[i].servers[j], .next = now};
     }
+    str_copy(h->tag, log_thread_tag(), sizeof(h->tag));
     pthread_mutex_init(&h->mu, NULL);
     pthread_cond_init(&h->cv, NULL);
     atomic_init(&h->done, false);
