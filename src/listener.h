@@ -8,7 +8,9 @@
 #include "io_event.h"
 
 /* Linux reparte conexiones entre sockets SO_REUSEPORT; macOS/BSD no, así
- * que allí el master abre los sockets y los pasa a los workers. */
+ * que allí el master abre los sockets y los pasa a los hilos worker por el
+ * canal (SCM_RIGHTS también funciona dentro del mismo proceso: el worker
+ * recibe un duplicado del descriptor que puede cerrar por su cuenta). */
 #if defined(__linux__)
 #define PROXY_PER_WORKER_LISTEN 1
 #else
@@ -18,7 +20,7 @@
 #define CHAN_MAGIC 0x50525859u
 #define CHAN_MAX_FDS 64
 
-enum { CHAN_CONFIG = 1 };
+enum { CHAN_CONFIG = 1, CHAN_STOP = 2 };
 
 typedef struct listener {
     io_handler_t h;
@@ -33,7 +35,8 @@ int listener_open(const char *addr, bool reuseport, char *err, size_t errlen);
 /* Comprueba que la dirección se puede enlazar (sin quedarse el socket). */
 int listener_test_bind(const char *addr, char *err, size_t errlen);
 
-/* Canal master -> worker (socketpair) con paso de fds (SCM_RIGHTS). */
+/* Canal master -> hilo worker (socketpair) con paso de fds (SCM_RIGHTS).
+ * El master detecta el fin de un worker por el EOF de su extremo. */
 typedef struct {
     uint32_t cmd;
     char *payload; /* malloc, terminado en '\0' */

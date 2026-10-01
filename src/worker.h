@@ -13,7 +13,7 @@
 
 struct session;
 
-/* Estado global del proceso worker (un único hilo de event loop). */
+/* Estado de un worker: uno por hilo (_Thread_local), con su event loop. */
 typedef struct worker {
     int id;
     io_loop_t *loop;
@@ -29,17 +29,21 @@ typedef struct worker {
     uint64_t stop_deadline;
 } worker_t;
 
-extern worker_t W;
+extern _Thread_local worker_t W;
 
 void rt_ref(runtime_t *rt);
 void rt_unref(runtime_t *rt);
 
+/* Cuerpo del hilo worker; vuelve tras CHAN_STOP o EOF del canal.
+ * No cierra chan_fd (lo hace quien lanzó el hilo). */
 int worker_main(int id, int chan_fd, stats_worker_t *st);
 
 /* connection.c */
 void session_accept(int fd, const struct sockaddr *peer, const char *fe_key);
 void sessions_close_idle(void);
 void sessions_close_all(void);
+/* Libera la arena de sesiones del hilo (tras sessions_close_all). */
+void sessions_free_arena(void);
 void upstream_pool_drain(server_t *srv);
 
 #endif

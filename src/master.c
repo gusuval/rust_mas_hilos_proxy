@@ -1,13 +1,25 @@
 #include "master.h"
 
+/*
+ * Hilo master: valida la config, lanza N hilos worker (cada uno con su
+ * event loop), atiende las señales del proceso, vigila el fichero de
+ * config, reparte las recargas y sirve las estadísticas.
+ *
+ * Los workers son hilos del mismo proceso (pthread), no procesos hijos:
+ * comparten memoria, pero cada uno tiene su estado (_Thread_local) y solo
+ * hablan con el master por su canal (socketpair). Al ser un solo proceso,
+ * un fallo grave (SIGSEGV) en un worker termina todo el proxy; lo que sí se
+ * relanza es un worker cuyo hilo termina por su cuenta (p. ej. config
+ * rechazada al arrancar).
+ */
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include "io_event.h"
@@ -24,8 +36,16 @@
 #define SHUTDOWN_GRACE_MS 12000
 
 typedef struct {
-    pid_t pid;
-    int chan;
+    io_handler_t h;
+    int fd;
+} fdh_t;
+
+typedef struct {
+    int id;
+    pthread_t thr;
+    bool running;   /* hilo lanzado y aún sin join */
+    fdh_t chan;     /* extremo del master; EOF = el hilo ha terminado */
+    int worker_fd;  /* extremo del worker (lo cierra el propio hilo) */
     uint64_t started;
     int quick_crashes;
     bool pending_respawn;
@@ -35,11 +55,6 @@ typedef struct {
     char key[128];
     int fd;
 } mlisten_t;
-
-typedef struct {
-    io_handler_t h;
-    int fd;
-} fdh_t;
 
 static struct {
     io_loop_t *loop;
@@ -51,6 +66,7 @@ static struct {
     wslot_t *w;
     stats_shm_t *stats;
     bool stopping;
+    bool forced_exit;
     uint64_t stop_deadline;
     int sig_pipe[2];
     fdh_t sig_h, watch_h, stats_h;
@@ -136,52 +152,67 @@ static int send_config(int i)
         q += l + 1;
         fds[k] = M.ml[k].fd;
     }
-    int r = chan_send(M.w[i].chan, CHAN_CONFIG, p, (uint32_t)len, fds, M.nml);
+    int r = chan_send(M.w[i].chan.fd, CHAN_CONFIG, p, (uint32_t)len, fds, M.nml);
     free(p);
     return r;
 }
 
+static void *worker_thread(void *arg)
+{
+    wslot_t *w = arg;
+    char name[16];
+    snprintf(name, sizeof(name), "proxy-w%d", w->id);
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), name);
+#elif defined(__APPLE__)
+    pthread_setname_np(name);
+#endif
+    int rc = worker_main(w->id, w->worker_fd, &M.stats->w[w->id]);
+    /* Cerrar nuestro extremo despierta al master (EOF en su extremo). */
+    close(w->worker_fd);
+    return (void *)(intptr_t)rc;
+}
+
+static void chan_event(io_handler_t *h, uint32_t ev);
+
 static int spawn(int i)
 {
+    wslot_t *w = &M.w[i];
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
         LOGE("socketpair: %s", strerror(errno));
         return -1;
     }
-    pid_t pid = fork();
-    if (pid < 0) {
-        LOGE("fork: %s", strerror(errno));
+    set_cloexec(sv[0]);
+    set_cloexec(sv[1]);
+    w->id = i;
+    w->chan.fd = sv[0];
+    w->chan.h.on_event = chan_event;
+    w->worker_fd = sv[1];
+    /* La config va antes de lanzar el hilo: la encuentra al arrancar. */
+    if (send_config(i) < 0) {
+        LOGE("no se pudo enviar la config al worker %d", i);
         close(sv[0]);
         close(sv[1]);
         return -1;
     }
-    if (pid == 0) {
-        /* hijo: soltar todo lo que pertenece al master */
+    /* El hilo hereda la máscara: todas las señales bloqueadas, así solo
+     * las recibe el hilo master. */
+    sigset_t all, old;
+    sigfillset(&all);
+    pthread_sigmask(SIG_SETMASK, &all, &old);
+    int err = pthread_create(&w->thr, NULL, worker_thread, w);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    if (err) {
+        LOGE("pthread_create: %s", strerror(err));
         close(sv[0]);
-        for (int k = 0; k < M.nworkers; k++)
-            if (M.w[k].chan >= 0)
-                close(M.w[k].chan);
-        close(M.sig_pipe[0]);
-        close(M.sig_pipe[1]);
-        if (M.stats_h.fd >= 0)
-            close(M.stats_h.fd);
-        if (M.watch)
-            close(watch_fd(M.watch));
-        io_loop_abandon(M.loop);
-        signal(SIGHUP, SIG_DFL);
-        signal(SIGCHLD, SIG_DFL);
-        /* exit() y no _exit(): el master no usa stdio con buffer, y así los
-         * atexit (p. ej. LeakSanitizer) también corren en los workers. */
-        exit(worker_main(i, sv[1], &M.stats->w[i]));
+        close(sv[1]);
+        return -1;
     }
-    close(sv[1]);
-    set_cloexec(sv[0]);
-    M.w[i].pid = pid;
-    M.w[i].chan = sv[0];
-    M.w[i].started = mono_ms();
-    M.w[i].pending_respawn = false;
-    if (send_config(i) < 0)
-        LOGE("no se pudo enviar la config al worker %d", i);
+    w->running = true;
+    w->started = mono_ms();
+    w->pending_respawn = false;
+    io_loop_add(M.loop, sv[0], IO_READ, &w->chan.h);
     return 0;
 }
 
@@ -222,7 +253,7 @@ static void reload(bool forced)
     M.cfg = cfg;
     log_set_level(cfg->log_level);
     for (int i = 0; i < M.nworkers; i++)
-        if (M.w[i].pid > 0 && send_config(i) < 0)
+        if (M.w[i].running && send_config(i) < 0)
             LOGE("no se pudo enviar la config al worker %d", i);
     atomic_fetch_add(&M.stats->reloads_ok, 1);
     LOGI("configuración recargada (%s)", forced ? "SIGHUP" : "cambio en fichero");
@@ -244,70 +275,74 @@ static void respawn_fire(io_timer_t *t)
         if (M.w[i].pending_respawn) {
             if (spawn(i) == 0) {
                 atomic_fetch_add(&M.stats->worker_restarts, 1);
-                LOGI("worker %d relanzado (pid %d)", i, (int)M.w[i].pid);
+                LOGI("worker %d relanzado", i);
             } else {
                 io_timer_after(M.loop, &M.respawn, RESPAWN_DELAY_MS);
             }
         }
 }
 
-static void reap_children(void)
+/* El hilo del worker i ha terminado (EOF en su canal): join y relanzar. */
+static void worker_exited(int i)
 {
-    for (;;) {
-        int status;
-        pid_t pid = waitpid(-1, &status, WNOHANG);
-        if (pid <= 0)
-            break;
-        for (int i = 0; i < M.nworkers; i++) {
-            if (M.w[i].pid != pid)
-                continue;
-            M.w[i].pid = 0;
-            close(M.w[i].chan);
-            M.w[i].chan = -1;
-            atomic_store(&M.stats->w[i].pid, 0);
-            atomic_store(&M.stats->w[i].active_conns, 0);
-            if (M.stopping)
-                break;
-            if (WIFSIGNALED(status))
-                LOGE("worker %d (pid %d) murió por la señal %d", i, (int)pid, WTERMSIG(status));
-            else
-                LOGE("worker %d (pid %d) terminó con código %d", i, (int)pid, WEXITSTATUS(status));
-            uint64_t alive = mono_ms() - M.w[i].started;
-            M.w[i].quick_crashes = alive < 1000 ? M.w[i].quick_crashes + 1 : 0;
-            if (M.w[i].quick_crashes > 10) {
-                LOGE("worker %d falla al arrancar repetidamente; se abandona", i);
-                break;
-            }
-            M.w[i].pending_respawn = true;
-            io_timer_after(M.loop, &M.respawn,
-                           M.w[i].quick_crashes ? RESPAWN_DELAY_MS * (uint64_t)M.w[i].quick_crashes : 50);
-        }
+    wslot_t *w = &M.w[i];
+    void *ret = NULL;
+    io_loop_del(M.loop, w->chan.fd);
+    close(w->chan.fd);
+    w->chan.fd = -1;
+    pthread_join(w->thr, &ret);
+    w->running = false;
+    if (M.stopping)
+        return;
+    LOGE("worker %d terminó con código %d", i, (int)(intptr_t)ret);
+    uint64_t alive = mono_ms() - w->started;
+    w->quick_crashes = alive < 1000 ? w->quick_crashes + 1 : 0;
+    if (w->quick_crashes > 10) {
+        LOGE("worker %d falla al arrancar repetidamente; se abandona", i);
+        return;
     }
+    w->pending_respawn = true;
+    io_timer_after(M.loop, &M.respawn,
+                   w->quick_crashes ? RESPAWN_DELAY_MS * (uint64_t)w->quick_crashes : 50);
+}
+
+static void chan_event(io_handler_t *h, uint32_t ev)
+{
+    (void)ev;
+    wslot_t *w = CONTAINER_OF(h, wslot_t, chan.h);
+    char c;
+    ssize_t n;
+    /* El worker nunca escribe: solo interesa el EOF. */
+    while ((n = recv(w->chan.fd, &c, 1, MSG_DONTWAIT)) > 0)
+        ;
+    if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+        worker_exited(w->id);
 }
 
 static int alive_workers(void)
 {
     int n = 0;
     for (int i = 0; i < M.nworkers; i++)
-        if (M.w[i].pid > 0)
+        if (M.w[i].running)
             n++;
     return n;
 }
 
 static void stop_check(io_timer_t *t)
 {
-    reap_children();
     if (alive_workers() == 0) {
         io_loop_stop(M.loop);
         return;
     }
     if (mono_ms() >= M.stop_deadline) {
-        LOGW("forzando la salida de los workers restantes");
-        for (int i = 0; i < M.nworkers; i++)
-            if (M.w[i].pid > 0)
-                kill(M.w[i].pid, SIGKILL);
+        /* Un hilo no se puede matar por separado: se sale del proceso con
+         * los workers restantes aún vivos. */
+        LOGW("%d workers no terminaron a tiempo; se fuerza la salida", alive_workers());
+        M.forced_exit = true;
+        io_loop_stop(M.loop);
+        return;
     }
-    io_timer_after(M.loop, t, 100);
+    io_timer_after(M.loop, t, 50);
 }
 
 static void begin_shutdown(int sig)
@@ -318,9 +353,9 @@ static void begin_shutdown(int sig)
     M.stop_deadline = mono_ms() + SHUTDOWN_GRACE_MS;
     LOGI("señal %d: parando workers", sig);
     for (int i = 0; i < M.nworkers; i++)
-        if (M.w[i].pid > 0)
-            kill(M.w[i].pid, SIGTERM);
-    io_timer_after(M.loop, &M.stop_timer, 50);
+        if (M.w[i].running && chan_send(M.w[i].chan.fd, CHAN_STOP, NULL, 0, NULL, 0) < 0)
+            LOGE("no se pudo pedir la parada al worker %d", i);
+    io_timer_after(M.loop, &M.stop_timer, 20);
 }
 
 static void sig_event(io_handler_t *h, uint32_t ev)
@@ -333,9 +368,6 @@ static void sig_event(io_handler_t *h, uint32_t ev)
         case SIGHUP:
             if (!M.stopping)
                 reload(true);
-            break;
-        case SIGCHLD:
-            reap_children();
             break;
         case SIGTERM:
         case SIGINT:
@@ -436,7 +468,7 @@ int master_run(const char *cfg_path, config_t *cfg, char *cfg_text)
         return 1;
     }
     for (int i = 0; i < M.nworkers; i++)
-        M.w[i].chan = -1;
+        M.w[i].chan.fd = M.w[i].worker_fd = -1;
     set_nonblock(M.sig_pipe[0]);
     set_nonblock(M.sig_pipe[1]);
     set_cloexec(M.sig_pipe[0]);
@@ -448,7 +480,6 @@ int master_run(const char *cfg_path, config_t *cfg, char *cfg_text)
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
     sigaction(SIGHUP, &sa, NULL);
-    sigaction(SIGCHLD, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGQUIT, &sa, NULL);
@@ -475,7 +506,7 @@ int master_run(const char *cfg_path, config_t *cfg, char *cfg_text)
     io_timer_init(&M.respawn, respawn_fire);
     io_timer_init(&M.stop_timer, stop_check);
 
-    LOGI("master pid %d, %d workers, config %s", (int)getpid(), M.nworkers, cfg_path);
+    LOGI("proxy pid %d, %d hilos worker, config %s", (int)getpid(), M.nworkers, cfg_path);
     for (int i = 0; i < M.nworkers; i++)
         if (spawn(i) < 0)
             return 1;
@@ -484,6 +515,11 @@ int master_run(const char *cfg_path, config_t *cfg, char *cfg_text)
 
     if (M.stats_path[0])
         unlink(M.stats_path);
+    if (M.forced_exit) {
+        /* Quedan hilos usando stats y config: no se libera nada. */
+        LOGI("master terminado (salida forzada)");
+        return 0;
+    }
     watch_close(M.watch);
     for (int k = 0; k < M.nml; k++)
         close(M.ml[k].fd);

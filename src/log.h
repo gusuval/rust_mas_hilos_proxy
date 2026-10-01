@@ -2,10 +2,11 @@
 #define LOG_H
 
 /*
- * Logging asíncrono: los productores (event loop, hilo de health) copian
- * el mensaje a un ring buffer MPSC de LOG_RING_SLOTS x LOG_SLOT_SIZE y un
- * hilo consumidor lo escribe al fichero. Nunca se bloquea al productor: si
- * el ring está lleno el mensaje se descarta y se cuenta.
+ * Logging asíncrono: los productores (master, hilos worker, hilos de
+ * health) copian el mensaje a un único ring buffer MPSC de LOG_RING_SLOTS x
+ * LOG_SLOT_SIZE y un hilo consumidor lo escribe al fichero. Nunca se
+ * bloquea al productor: si el ring está lleno el mensaje se descarta y se
+ * cuenta.
  */
 
 #include <stdarg.h>
@@ -18,14 +19,15 @@
 
 enum { LOG_DEBUG = 0, LOG_INFO, LOG_WARN, LOG_ERROR, LOG_ACCESS };
 
-/* path NULL, "" o "-" = stderr. tag identifica el proceso ("master", "w3"). */
+/* path NULL, "" o "-" = stderr. tag es la etiqueta por defecto ("master"). */
 int log_init(const char *path, int level, const char *tag);
 /* Cambia el nivel en caliente (p. ej. tras una recarga). */
 void log_set_level(int level);
 int log_level_from_str(const char *s);
 void log_shutdown(void);
-/* Tras fork(): descarta el estado heredado y arranca un consumidor nuevo. */
-int log_reinit_child(const char *tag);
+/* Etiqueta de los mensajes del hilo actual ("w3"); NULL/"" = la de log_init. */
+void log_set_thread_tag(const char *tag);
+const char *log_thread_tag(void);
 
 void log_msg(int level, const char *fmt, ...)
     __attribute__((format(printf, 2, 3)));

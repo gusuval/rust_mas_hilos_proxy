@@ -34,14 +34,16 @@ Palabras clave: **DEBE** = obligatorio, **DEBERÍA** = recomendado,
 - ASan/UBSan DEBEN poder activarse con `-Db_sanitize=address,undefined` y
   los tests DEBEN pasar con ellos.
 
-## 3. Modelo de procesos y event loop
+## 3. Modelo de hilos y event loop
 
-- Un **proceso master** y **N workers** (`workers = "auto"` → nº de CPUs).
-- El master: parsea/valida la config, crea workers, vigila la config,
-  reenvía recargas, sirve el endpoint de estadísticas y re-lanza un worker
-  que muera inesperadamente.
-- Cada worker: un único hilo de event loop + un hilo de health checks + un
-  hilo consumidor de log. Ninguna llamada bloqueante en el hilo del loop.
+- Un único proceso con un **hilo master** y **N hilos worker** (`pthread`,
+  `workers = "auto"` → nº de CPUs).
+- El master: parsea/valida la config, crea los hilos worker, atiende las
+  señales, vigila la config, reenvía recargas, sirve el endpoint de
+  estadísticas y re-lanza un worker cuyo hilo termine inesperadamente.
+- Cada worker: un único hilo de event loop + un hilo de health checks. Un
+  hilo consumidor de log para todo el proceso. Ninguna llamada bloqueante
+  en el hilo del loop.
 - **Linux**: cada worker abre su propio socket de escucha con
   `SO_REUSEPORT` (el kernel reparte conexiones).
 - **macOS**: `SO_REUSEPORT` no reparte carga; el master abre el socket y
@@ -258,14 +260,14 @@ Proceso:
 
 ## 9. Observabilidad
 
-- **Log**: ring buffer 4096 × 512 B por worker, hilo consumidor que
+- **Log**: ring buffer MPSC 4096 × 512 B por proceso, hilo consumidor que
   escribe al fichero. Si el buffer se llena se descarta el mensaje y se
   incrementa un contador (nunca se bloquea el loop). Access log con:
   timestamp, IP cliente, host, método, ruta, status, backend, latencia.
 - **Stats**: el master sirve en `stats_socket` (UNIX) un JSON con uptime,
   conexiones activas, peticiones totales, respuestas por código (2xx…5xx),
   y por servidor backend: estado, conexiones activas, carga reportada,
-  fallos. Los workers publican contadores en una región `mmap` compartida.
+  fallos. Cada hilo worker publica sus contadores en su propio slot.
   Consulta: `nc -U /tmp/proxy.sock` o `socat`.
 
 ## 10. Pruebas

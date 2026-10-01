@@ -110,6 +110,9 @@ static struct {
     char path[512];
 } G = {.fd = 2};
 
+/* Etiqueta del hilo actual ("w3"); vacía = la del proceso (G.tag). */
+static _Thread_local char t_tag[16];
+
 static const char *level_name[] = {"debug", "info", "warn", "error", "access"};
 
 int log_level_from_str(const char *s)
@@ -189,15 +192,12 @@ int log_init(const char *path, int level, const char *tag)
     return start();
 }
 
-int log_reinit_child(const char *tag)
+void log_set_thread_tag(const char *tag)
 {
-    /* El hilo consumidor no existe en el hijo; el ring heredado puede
-     * contener mensajes del padre que no deben duplicarse. */
-    G.running = false;
-    G.ring = NULL; /* memoria heredada: se abandona */
-    str_copy(G.tag, tag ? tag : "", sizeof(G.tag));
-    return start();
+    str_copy(t_tag, tag ? tag : "", sizeof(t_tag));
 }
+
+const char *log_thread_tag(void) { return t_tag[0] ? t_tag : G.tag; }
 
 void log_shutdown(void)
 {
@@ -227,7 +227,7 @@ void log_vmsg(int level, const char *fmt, va_list ap)
         cached_sec = ts.tv_sec;
     }
     int n = snprintf(line, sizeof(line), "%s.%03ldZ [%s] [%s] ", cached_ts,
-                     ts.tv_nsec / 1000000L, level_name[level], G.tag);
+                     ts.tv_nsec / 1000000L, level_name[level], log_thread_tag());
     if (n < 0)
         return;
     int m = vsnprintf(line + n, sizeof(line) - (size_t)n, fmt, ap);

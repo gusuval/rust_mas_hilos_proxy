@@ -112,15 +112,25 @@ static inline const cfg_timeouts_t *TO(void) { return &W.rt->cfg->timeouts; }
 /* arena de sesiones                                                    */
 /* ------------------------------------------------------------------ */
 
-static session_t *free_sessions;
+/* Por hilo worker: ningún otro hilo toca estas sesiones. */
+typedef struct sess_chunk {
+    struct sess_chunk *next;
+    session_t s[];
+} sess_chunk_t;
+
+static _Thread_local session_t *free_sessions;
+static _Thread_local sess_chunk_t *sess_chunks;
 
 static session_t *sess_alloc(void)
 {
     if (!free_sessions) {
         enum { CHUNK = 256 };
-        session_t *c = calloc(CHUNK, sizeof(session_t));
-        if (!c)
+        sess_chunk_t *ch = calloc(1, sizeof(sess_chunk_t) + CHUNK * sizeof(session_t));
+        if (!ch)
             return NULL;
+        ch->next = sess_chunks;
+        sess_chunks = ch;
+        session_t *c = ch->s;
         for (int i = 0; i < CHUNK; i++) {
             c[i].next = free_sessions;
             free_sessions = &c[i];
@@ -1449,4 +1459,14 @@ void sessions_close_all(void)
 {
     while (W.sessions)
         sess_close(W.sessions);
+}
+
+void sessions_free_arena(void)
+{
+    while (sess_chunks) {
+        sess_chunk_t *n = sess_chunks->next;
+        free(sess_chunks);
+        sess_chunks = n;
+    }
+    free_sessions = NULL;
 }

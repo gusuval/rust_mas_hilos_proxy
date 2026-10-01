@@ -15,7 +15,7 @@ Estado: ✅ verificado automáticamente · 🔶 verificado parcialmente o por re
 |---|---|---|
 | RF-01 | Meson elige `io_event_epoll.c` / `io_event_kqueue.c` por plataforma (`src/meson.build`). Nada fuera de ellos incluye epoll/kqueue. UT `test_core` (readiness, timers). | ✅ Linux · 🔶 kqueue: solo comprobación de sintaxis |
 | RF-02 | Revisión: todos los bucles de E/S (`connection.c`, `worker.c`, `test_backend.c`) iteran hasta `EAGAIN`. IT "POST 10 MB …" (cuerpos mucho mayores que un buffer) | ✅ |
-| RF-03 | IT "worker muerto es relanzado", "tráfico normal tras relanzar el worker" | ✅ |
+| RF-03 | IT "workers como hilos: sin procesos hijos", "un hilo proxy-wN por worker", "SIGTERM: parada ordenada de cada worker". El relanzamiento de un hilo que termina no tiene IT: no se puede matar un hilo desde fuera | ✅ |
 | RF-04 | Linux: `SO_REUSEPORT` por worker. IT "stats: agregado de 2 workers". macOS/BSD: el master abre los sockets y los pasa por `SCM_RIGHTS` | ✅ Linux · ⬜ macOS |
 | RF-05 | UT `test_timers_order_cancel_lazy`, `test_now_fresh_in_handler` | ✅ |
 | RF-10 | IT: frontends `web`, `web-tls`, `admin` y `extra` (este último añadido en caliente) | ✅ |
@@ -32,7 +32,7 @@ Estado: ✅ verificado automáticamente · 🔶 verificado parcialmente o por re
 | RF-32 | IT "X-Forwarded-For concatenado", "X-Real-IP reemplazado", "X-Forwarded-Proto: http/https" | ✅ |
 | RF-33 | UT `test_connection_tokens`. IT "hop-by-hop …", "cabecera listada en Connection eliminada" | ✅ |
 | RF-34 | UT `test_smuggling`. IT "Content-Length + Transfer-Encoding -> 400" | ✅ |
-| RF-35 | IT "POST 10 MB Content-Length íntegro" (SHA-256), "memoria acotada: pico RSS por worker < 64 MB" | ✅ |
+| RF-35 | IT "POST 10 MB Content-Length íntegro" (SHA-256), "memoria acotada: pico RSS del proceso < workers × 64 MB" | ✅ |
 | RF-36 | UT `test_body_chunked*`. IT "POST 10 MB chunked íntegro", "respuesta chunked", "chunked reenviado con trailers" | ✅ |
 | RF-37 | IT "HEAD conserva Content-Length sin cuerpo", "204 sin cuerpo", "respuesta delimitada por cierre", "HEAD/204 + petición siguiente" | ✅ |
 | RF-38 | IT "10 peticiones en 1 conexión cliente", "HTTP/1.0 …" | ✅ |

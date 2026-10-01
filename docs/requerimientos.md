@@ -21,7 +21,7 @@ integración, **BM** = benchmark, **RV** = revisión de código/documentación.
 |---|---|---|---|---|---|
 | RF-01 | El proxy usa `epoll` en Linux y `kqueue` en macOS/BSD, tras una API común `io_event.h`. | M | Meson compila `io_event_epoll.c` en Linux y `io_event_kqueue.c` en macOS; el resto del código no incluye cabeceras de epoll/kqueue. | RV, IT | §3.1 |
 | RF-02 | Toda la E/S es no bloqueante y edge-triggered (`EPOLLET` / `EV_CLEAR`), drenando hasta `EAGAIN`. | M | Revisión: cada handler de lectura/escritura itera hasta `EAGAIN`; test con cuerpos > 16 KB sin cuelgues. | RV, IT | §3 |
-| RF-03 | Modelo master + N workers (`workers = "auto"` → nº CPUs). El master re-lanza un worker que muere. | M | `kill -9` a un worker → el master lanza otro y el tráfico continúa. | IT | §3 |
+| RF-03 | Un proceso con hilo master + N hilos worker (`workers = "auto"` → nº CPUs). El master re-lanza un worker cuyo hilo termina. | M | Sin procesos hijos y un hilo `proxy-wN` por worker; parada ordenada de cada worker con SIGTERM. | IT | §3 |
 | RF-04 | En Linux cada worker escucha con `SO_REUSEPORT`; en macOS los workers comparten el socket del master. | M | Stats muestran peticiones repartidas entre todos los workers en ambas plataformas. | IT | §3 |
 | RF-05 | El event loop ofrece timers sin usar un fd por timer. | M | Test unitario de la rueda/heap de timers (orden, cancelación). | UT | §3.1 |
 | RF-06 | Windows / IOCP queda fuera de alcance. | — | No aplica. | — | §1 |
@@ -95,7 +95,7 @@ integración, **BM** = benchmark, **RV** = revisión de código/documentación.
 
 | ID | Requerimiento | Prio. | Criterio de aceptación | Verif. | Spec |
 |---|---|---|---|---|---|
-| RF-70 | Log asíncrono: ring buffer 4096 × 512 B por worker con hilo consumidor; si se llena, descarta y cuenta. | M | Revisión; test unitario del ring buffer (lleno, vacío, concurrencia). | UT, RV | §9 |
+| RF-70 | Log asíncrono: ring buffer MPSC 4096 × 512 B por proceso con hilo consumidor; si se llena, descarta y cuenta. | M | Revisión; test unitario del ring buffer (lleno, vacío, concurrencia). | UT, RV | §9 |
 | RF-71 | Access log con timestamp, IP, host, método, ruta, status, backend y latencia. | M | Línea de log por petición con todos los campos. | IT | §9 |
 | RF-72 | Endpoint de estadísticas JSON por socket UNIX, agregado de todos los workers. | M | `nc -U /tmp/proxy.sock` devuelve JSON válido (`jq .`) con los campos de la spec. | IT | §9 |
 

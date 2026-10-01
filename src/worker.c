@@ -1,7 +1,6 @@
 #include "worker.h"
 
 #include <errno.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,17 +13,18 @@
 #define TICK_MS 250
 #define STOP_GRACE_MS 10000
 
-worker_t W;
-
-static int sig_pipe[2] = {-1, -1};
+/* Cada hilo worker tiene su propia copia: el código del event loop
+ * (connection.c, listeners, timers) sigue siendo monohilo. */
+_Thread_local worker_t W;
 
 typedef struct {
     io_handler_t h;
     int fd;
 } fd_handler_t;
 
-static fd_handler_t chan_h, sig_h;
-static io_timer_t tick;
+static _Thread_local fd_handler_t chan_h;
+static _Thread_local io_timer_t tick;
+static _Thread_local int exit_code;
 
 /* ------------------------------------------------------------------ */
 /* generaciones de configuración                                        */
@@ -294,38 +294,24 @@ static void chan_event(io_handler_t *h, uint32_t ev)
         }
         if (m.cmd == CHAN_CONFIG) {
             if (handle_config(&m) < 0 && !W.rt) {
-                LOGE("sin configuración válida, saliendo");
+                /* Solo termina este hilo: el master lo verá por el EOF del
+                 * canal y decidirá si relanzarlo. */
+                LOGE("sin configuración válida, el worker termina");
+                exit_code = 2;
+                io_loop_stop(W.loop);
                 free(m.payload);
-                exit(2);
+                break;
             }
+        } else if (m.cmd == CHAN_STOP) {
+            begin_stop();
         }
         free(m.payload);
     }
 }
 
-static void on_signal(int sig)
-{
-    int saved = errno;
-    unsigned char c = (unsigned char)sig;
-    ssize_t r = write(sig_pipe[1], &c, 1);
-    (void)r;
-    errno = saved;
-}
-
-static void sig_event(io_handler_t *h, uint32_t ev)
-{
-    (void)h;
-    (void)ev;
-    unsigned char c;
-    while (read(sig_pipe[0], &c, 1) == 1)
-        if (c == SIGTERM || c == SIGINT || c == SIGQUIT)
-            begin_stop();
-}
-
 static void publish_stats(void)
 {
     stats_worker_t *st = W.st;
-    atomic_store_explicit(&st->log_dropped, log_dropped(), memory_order_relaxed);
     atomic_store_explicit(&st->buffers_in_use, bufpool_in_use(W.bp), memory_order_relaxed);
     if (!W.rt)
         return;
@@ -369,42 +355,25 @@ int worker_main(int id, int chan_fd, stats_worker_t *st)
 {
     char tag[16];
     snprintf(tag, sizeof(tag), "w%d", id);
-    log_reinit_child(tag);
+    log_set_thread_tag(tag);
 
+    /* Las señales las atiende solo el hilo master (el hilo se crea con
+     * todas bloqueadas); aquí la parada llega como CHAN_STOP. */
     memset(&W, 0, sizeof(W));
+    exit_code = 0;
     W.id = id;
     W.st = st;
-    atomic_store(&st->pid, (int)getpid());
     atomic_store(&st->active_conns, 0);
 
     W.loop = io_loop_create(1024);
     W.bp = bufpool_create(256);
     if (!W.loop || !W.bp) {
         LOGE("no se puede crear el event loop");
+        io_loop_destroy(W.loop);
+        bufpool_destroy(W.bp);
         return 1;
     }
-    if (pipe(sig_pipe) < 0)
-        return 1;
-    set_nonblock(sig_pipe[0]);
-    set_nonblock(sig_pipe[1]);
-    set_cloexec(sig_pipe[0]);
-    set_cloexec(sig_pipe[1]);
-
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = on_signal;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGQUIT, &sa, NULL);
-    signal(SIGHUP, SIG_IGN); /* la recarga la coordina el master */
-    signal(SIGPIPE, SIG_IGN);
-    signal(SIGCHLD, SIG_DFL);
-
-    sig_h.h.on_event = sig_event;
-    sig_h.fd = sig_pipe[0];
-    io_loop_add(W.loop, sig_pipe[0], IO_READ, &sig_h.h);
+    atomic_store(&st->alive, 1);
 
     set_nonblock(chan_fd);
     chan_h.h.on_event = chan_event;
@@ -415,8 +384,9 @@ int worker_main(int id, int chan_fd, stats_worker_t *st)
     io_timer_init(&tick, on_tick);
     io_timer_after(W.loop, &tick, TICK_MS);
 
-    LOGI("worker %d arrancado (pid %d)", id, (int)getpid());
-    io_loop_run(W.loop);
+    LOGI("worker %d arrancado (hilo)", id);
+    if (!exit_code) /* la config inicial pudo ser rechazada */
+        io_loop_run(W.loop);
 
     /* salida ordenada */
     close_all_listeners();
@@ -432,8 +402,14 @@ int worker_main(int id, int chan_fd, stats_worker_t *st)
         if (W.retired)
             usleep(10000);
     }
+    /* El proceso sigue vivo: liberar todo lo que era de este hilo. */
+    io_timer_cancel(W.loop, &tick);
+    io_loop_destroy(W.loop); /* ejecuta las liberaciones diferidas */
+    sessions_free_arena();
+    bufpool_destroy(W.bp);
+    atomic_store(&st->active_conns, 0);
+    atomic_store(&st->alive, 0);
     LOGI("worker %d terminado", id);
-    atomic_store(&st->pid, 0);
-    log_shutdown();
-    return 0;
+    memset(&W, 0, sizeof(W));
+    return exit_code;
 }
