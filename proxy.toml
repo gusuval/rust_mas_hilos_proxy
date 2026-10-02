@@ -1,10 +1,10 @@
 # Configuración de referencia del proxy (SPEC.md §4).
 #
 # Para una configuración ejecutable con certificados de prueba:
-#   tests/gen_config.sh demo && ./build/src/proxy -c demo/proxy.toml
+#   tests/gen_config.sh demo && ./target/release/proxy -c demo/proxy.toml
 #
-# Validar sin arrancar:   ./build/src/proxy -t -c proxy.toml
-# Recargar:               guardar el fichero, o kill -HUP <pid del master>
+# Validar sin arrancar:   ./target/release/proxy -t -c proxy.toml
+# Recargar:               guardar el fichero, o kill -HUP <pid del proxy>
 # Rutas relativas (certificados, log) se resuelven respecto a este fichero.
 
 [global]

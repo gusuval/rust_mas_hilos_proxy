@@ -1,0 +1,32 @@
+[package]
+name = "proxy"
+version = "2.0.0"
+edition = "2024"
+description = "Proxy inverso L7 con terminación TLS: hilo master + N hilos worker con event loop mio (epoll/kqueue)"
+license = "MIT"
+repository = "https://github.com/gusuval/rust_mas_hilos_proxy"
+
+[dependencies]
+base64 = "0.23.1"
+libc = "0.2.189"
+mio = { version = "1.2.3", features = ["os-poll", "net", "os-ext"] }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "tls12", "logging"] }
+sha1 = "0.11.0"
+socket2 = { version = "0.6.5", features = ["all"] }
+toml = "1.1.6"
+
+[features]
+# Proveedor criptográfico de rustls: aws-lc-rs (por defecto, el de rustls)
+# o ring (sin dependencias de C/cmake: --no-default-features -F ring).
+default = ["aws-lc"]
+aws-lc = ["rustls/aws_lc_rs"]
+ring = ["rustls/ring"]
+
+[[bin]]
+name = "proxy"
+path = "src/main.rs"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind"

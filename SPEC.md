@@ -1,4 +1,4 @@
-# Especificación — Proxy inverso L7 en C11 (epoll/kqueue)
+# Especificación — Proxy inverso L7 en Rust (epoll/kqueue)
 
 Este documento concreta los requisitos de `PROMPT.md` y resuelve las
 ambigüedades con el `README.md`. Cuando un punto de aquí contradice a otro
@@ -15,54 +15,47 @@ Palabras clave: **DEBE** = obligatorio, **DEBERÍA** = recomendado,
 |---|---|
 | Linux (`epoll`) y macOS/BSD (`kqueue`) | Windows / IOCP |
 | HTTP/1.0 y HTTP/1.1 (cliente↔proxy y proxy↔backend) | HTTP/2, HTTP/3 |
-| Terminación TLS en el proxy (OpenSSL ≥ 3.0) con SNI | TLS hacia los backends (van en claro) |
+| Terminación TLS en el proxy (rustls) con SNI | TLS hacia los backends (van en claro) |
 | Keep-alive en ambos lados, pipelining, chunked, WebSocket | Caché de respuestas, compresión |
 | Recarga de configuración automática y por `SIGHUP` | API de administración remota |
 
 ## 2. Plataforma y build
 
-- **C11** (`-std=c11`), compila sin warnings con `-Wall -Wextra -Wpedantic`.
-- **Meson** es el único sistema de build. Detecta la plataforma y compila
-  `io_event_epoll.c` o `io_event_kqueue.c`, y `watch_inotify.c` o
-  `watch_kqueue.c` (ver §8).
-- Dependencias: OpenSSL ≥ 3.0, tomlc99 (subproject/wrap), cmocka (solo tests).
-- Targets de Meson:
-  - `proxy` — el binario del proxy.
-  - `test_backend` — servidor backend de pruebas (§10.2).
-  - Suites cmocka registradas con `test()`.
-- Build `release` (`-Dbuildtype=release`) es el que se usa en el benchmark.
-- ASan/UBSan DEBEN poder activarse con `-Db_sanitize=address,undefined` y
-  los tests DEBEN pasar con ellos.
+- **Rust** (edición 2024), compila sin avisos de `rustc` ni de `cargo clippy`.
+  Sin `unsafe` en el camino de datos (solo en llamadas al sistema del master).
+- **cargo** es el único sistema de build. La E/S usa `mio` (epoll en Linux,
+  kqueue en macOS/BSD); la vigilancia del fichero de config, inotify en Linux
+  (ver §8).
+- Dependencias: `mio`, `socket2`, `rustls` (proveedor `aws-lc-rs` por defecto
+  o `ring` con `--no-default-features -F ring`), `toml`, `libc`; `sha1` y
+  `base64` solo para el WebSocket del backend de pruebas.
+- Binarios: `proxy`, `test_backend` (§10.2) y `ws_probe` (cliente WebSocket
+  de los tests). Tests unitarios con `cargo test`.
+- El benchmark usa el perfil `release` (LTO, `codegen-units = 1`).
 
 ## 3. Modelo de hilos y event loop
 
-- Un único proceso con un **hilo master** y **N hilos worker** (`pthread`,
-  `workers = "auto"` → nº de CPUs).
+- Un único proceso con un **hilo master** y **N hilos worker**
+  (`std::thread`, `workers = "auto"` → nº de CPUs).
 - El master: parsea/valida la config, crea los hilos worker, atiende las
   señales, vigila la config, reenvía recargas, sirve el endpoint de
-  estadísticas y re-lanza un worker cuyo hilo termine inesperadamente.
+  estadísticas y re-lanza un worker cuyo hilo termine inesperadamente
+  (también por `panic`).
 - Cada worker: un único hilo de event loop + un hilo de health checks. Un
   hilo consumidor de log para todo el proceso. Ninguna llamada bloqueante
   en el hilo del loop.
 - **Linux**: cada worker abre su propio socket de escucha con
   `SO_REUSEPORT` (el kernel reparte conexiones).
 - **macOS**: `SO_REUSEPORT` no reparte carga; el master abre el socket y
-  los workers lo heredan (accept compartido). Documentar la diferencia.
+  los workers usan un duplicado (accept compartido). Documentar la diferencia.
 - Todos los sockets en modo no bloqueante, **edge-triggered**
   (`EPOLLET` / `EV_CLEAR`): cada handler lee/escribe hasta `EAGAIN`.
 
-### 3.1 API `io_event.h`
+### 3.1 Event loop
 
-```c
-io_loop_t *io_loop_create(int max_events);
-int  io_loop_add(io_loop_t *, int fd, uint32_t events, void *udata);
-int  io_loop_mod(io_loop_t *, int fd, uint32_t events, void *udata);
-int  io_loop_del(io_loop_t *, int fd);
-int  io_loop_run(io_loop_t *);          /* hasta io_loop_stop() */
-void io_loop_stop(io_loop_t *);
-void io_loop_destroy(io_loop_t *);
-/* eventos: IO_READ, IO_WRITE, IO_ERROR, IO_HUP */
-```
+`mio::Poll` por hilo worker: registro de sockets con `Interest::READABLE |
+WRITABLE` en modo edge-triggered, token = clase + índice + generación del
+objeto (slab), y un `mio::Waker` para el canal con el master.
 
 Timers: el loop DEBE ofrecer timers (rueda de timers o min-heap) para los
 timeouts de §6.4; no se usa un fd por timer.
@@ -233,7 +226,7 @@ la nueva config y se mantiene la vieja, con error en el log):
   `fall` fallos consecutivos → `down`.
 - Activa: el hilo de health prueba cada `interval` (TCP connect o
   `GET path` esperando `2xx`); `rise` éxitos → `up`.
-- Estado compartido entre hilos por atómicos (C11 `<stdatomic.h>`).
+- Estado compartido entre hilos por atómicos (`std::sync::atomic`).
 - Servidores `down` se excluyen de todas las estrategias.
 
 ## 8. Recarga de configuración
@@ -260,7 +253,7 @@ Proceso:
 
 ## 9. Observabilidad
 
-- **Log**: ring buffer MPSC 4096 × 512 B por proceso, hilo consumidor que
+- **Log**: cola MPSC acotada de 4096 líneas (≤ 512 B) por proceso, hilo consumidor que
   escribe al fichero. Si el buffer se llena se descarta el mensaje y se
   incrementa un contador (nunca se bloquea el loop). Access log con:
   timestamp, IP cliente, host, método, ruta, status, backend, latencia.
@@ -272,7 +265,7 @@ Proceso:
 
 ## 10. Pruebas
 
-### 10.1 Unitarias (cmocka, `meson test`)
+### 10.1 Unitarias (`cargo test`)
 
 Como mínimo: parser HTTP (fragmentación, chunked, límites, smuggling),
 router (exacto/wildcard/default), estrategias de balanceo, parser y
@@ -280,8 +273,8 @@ validación de config, buffer_pool.
 
 ### 10.2 Backend de pruebas (`test_backend`)
 
-Servidor HTTP/1.1 en C sobre la **misma abstracción `io_event`** (kqueue en
-macOS, epoll en Linux). Opciones:
+Servidor HTTP/1.1 en Rust sobre **`mio`**, como el proxy (kqueue en macOS,
+epoll en Linux). Opciones:
 
 ```
 test_backend --port 9001 --name api-1 [--latency-ms N] [--load F|--load-auto]
@@ -325,6 +318,6 @@ test_backend --port 9001 --name api-1 [--latency-ms N] [--load F|--load-auto]
 
 ## 12. Entregables
 
-- Código + `meson.build`, tests pasando, `SPEC.md`, `README.md`
+- Código + `Cargo.toml`, tests pasando, `SPEC.md`, `README.md`
   actualizado con resultados reales del benchmark, config de ejemplo y
   vídeo demo.

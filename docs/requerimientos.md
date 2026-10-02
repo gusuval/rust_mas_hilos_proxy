@@ -1,4 +1,4 @@
-# Requerimientos — Proxy inverso L7 en C11 (epoll/kqueue)
+# Requerimientos — Proxy inverso L7 en Rust (epoll/kqueue)
 
 Catálogo de requerimientos verificables derivado de [`PROMPT.md`](../PROMPT.md)
 y detallado en [`SPEC.md`](../SPEC.md). Cada requerimiento tiene un
@@ -8,7 +8,11 @@ donde se detalla.
 **Prioridad**: **M** = obligatorio (must), **S** = recomendado (should),
 **C** = opcional (could).
 
-**Verificación**: **UT** = test unitario cmocka, **IT** = test de
+> El proyecto empezó en C11 + Meson, como pide `PROMPT.md`, y se ha portado a
+> Rust + cargo a petición del usuario. Los requerimientos que nombraban C,
+> Meson u OpenSSL se han adaptado; la trazabilidad (§4) lo indica.
+
+**Verificación**: **UT** = test unitario (`cargo test`), **IT** = test de
 integración, **BM** = benchmark, **RV** = revisión de código/documentación.
 
 ---
@@ -19,9 +23,9 @@ integración, **BM** = benchmark, **RV** = revisión de código/documentación.
 
 | ID | Requerimiento | Prio. | Criterio de aceptación | Verif. | Spec |
 |---|---|---|---|---|---|
-| RF-01 | El proxy usa `epoll` en Linux y `kqueue` en macOS/BSD, tras una API común `io_event.h`. | M | Meson compila `io_event_epoll.c` en Linux y `io_event_kqueue.c` en macOS; el resto del código no incluye cabeceras de epoll/kqueue. | RV, IT | §3.1 |
+| RF-01 | El proxy usa `epoll` en Linux y `kqueue` en macOS/BSD, tras una API común (`mio`). | M | `mio` elige epoll o kqueue por plataforma; el resto del código no usa epoll/kqueue directamente. | RV, IT | §3.1 |
 | RF-02 | Toda la E/S es no bloqueante y edge-triggered (`EPOLLET` / `EV_CLEAR`), drenando hasta `EAGAIN`. | M | Revisión: cada handler de lectura/escritura itera hasta `EAGAIN`; test con cuerpos > 16 KB sin cuelgues. | RV, IT | §3 |
-| RF-03 | Un proceso con hilo master + N hilos worker (`workers = "auto"` → nº CPUs). El master re-lanza un worker cuyo hilo termina. | M | Sin procesos hijos y un hilo `proxy-wN` por worker; parada ordenada de cada worker con SIGTERM. | IT | §3 |
+| RF-03 | Un proceso con hilo master + N hilos worker (`workers = "auto"` → nº CPUs). El master re-lanza un worker cuyo hilo termina, también por `panic`. | M | Sin procesos hijos y un hilo `proxy-wN` por worker; un worker con `panic` se relanza y el tráfico sigue; parada ordenada de cada worker con SIGTERM. | IT | §3 |
 | RF-04 | En Linux cada worker escucha con `SO_REUSEPORT`; en macOS los workers comparten el socket del master. | M | Stats muestran peticiones repartidas entre todos los workers en ambas plataformas. | IT | §3 |
 | RF-05 | El event loop ofrece timers sin usar un fd por timer. | M | Test unitario de la rueda/heap de timers (orden, cancelación). | UT | §3.1 |
 | RF-06 | Windows / IOCP queda fuera de alcance. | — | No aplica. | — | §1 |
@@ -31,7 +35,7 @@ integración, **BM** = benchmark, **RV** = revisión de código/documentación.
 | ID | Requerimiento | Prio. | Criterio de aceptación | Verif. | Spec |
 |---|---|---|---|---|---|
 | RF-10 | Se pueden definir varios frontends escuchando en puertos distintos. | M | Config con ≥ 2 frontends; ambos responden y tienen rutas independientes. | IT | §4 |
-| RF-11 | Un frontend puede terminar TLS (OpenSSL ≥ 3.0, TLS 1.2 y 1.3). | M | `curl --cacert ca.pem https://…` responde 200. | IT | §4, §5 |
+| RF-11 | Un frontend puede terminar TLS (rustls, TLS 1.2 y 1.3). | M | `curl --cacert ca.pem https://…` responde 200. | IT | §4, §5 |
 | RF-12 | Un frontend TLS admite varios certificados y los elige por SNI, con `default_cert` si no hay coincidencia. | M | `openssl s_client -servername X` recibe el certificado de X; SNI desconocido recibe el de por defecto. | IT | §5 |
 | RF-13 | Si el `Host:` no está cubierto por el certificado servido por SNI → `421`. | S | Petición con SNI `a.test` y `Host: b.test` → `421`. | IT | §5 |
 | RF-14 | La conexión proxy→backend es HTTP en claro. | M | Revisión de código. | RV | §1 |
@@ -95,7 +99,7 @@ integración, **BM** = benchmark, **RV** = revisión de código/documentación.
 
 | ID | Requerimiento | Prio. | Criterio de aceptación | Verif. | Spec |
 |---|---|---|---|---|---|
-| RF-70 | Log asíncrono: ring buffer MPSC 4096 × 512 B por proceso con hilo consumidor; si se llena, descarta y cuenta. | M | Revisión; test unitario del ring buffer (lleno, vacío, concurrencia). | UT, RV | §9 |
+| RF-70 | Log asíncrono: cola MPSC acotada de 4096 líneas (≤ 512 B) por proceso con hilo consumidor; si se llena, descarta y cuenta. | M | Revisión; test unitario de la cola (llena, vacía, concurrencia). | UT, RV | §9 |
 | RF-71 | Access log con timestamp, IP, host, método, ruta, status, backend y latencia. | M | Línea de log por petición con todos los campos. | IT | §9 |
 | RF-72 | Endpoint de estadísticas JSON por socket UNIX, agregado de todos los workers. | M | `nc -U /tmp/proxy.sock` devuelve JSON válido (`jq .`) con los campos de la spec. | IT | §9 |
 
@@ -103,7 +107,7 @@ integración, **BM** = benchmark, **RV** = revisión de código/documentación.
 
 | ID | Requerimiento | Prio. | Criterio de aceptación | Verif. | Spec |
 |---|---|---|---|---|---|
-| RF-80 | `test_backend` en C sobre `io_event` (kqueue en macOS, epoll en Linux) con `--port`, `--name`, `--latency-ms`, `--load`/`--load-auto`. | M | Compila y funciona en ambas plataformas. | IT | §10.2 |
+| RF-80 | `test_backend` en Rust sobre `mio` (kqueue en macOS, epoll en Linux) con `--port`, `--name`, `--latency-ms`, `--load`/`--load-auto`. | M | Compila y funciona en ambas plataformas. | IT | §10.2 |
 | RF-81 | `test_backend` soporta keep-alive, `/health`, `POST /echo` (incluido chunked) y WebSocket eco en `/ws`, y envía `X-Backend-Load`. | M | Tests de integración usan cada endpoint. | IT | §10.2 |
 | RF-82 | `tests/gen_config.sh` genera config TOML (varios frontends HTTP/TLS, dominios, backends, estrategias) y una CA + certificados con `openssl`. | M | El script genera ficheros con los que el proxy arranca. | IT | §10.3 |
 | RF-83 | `tests/integration/run.sh` lanza backends y proxy, ejecuta los casos y limpia procesos incluso si falla. | M | Tras un fallo forzado no quedan procesos (`pgrep`). | IT | §10.3 |
@@ -119,12 +123,12 @@ integración, **BM** = benchmark, **RV** = revisión de código/documentación.
 | RNF-02 | El benchmark reporta req/s, latencia media y p99, en HTTPS y HTTP, con hardware, kernel y nº de workers. | M | Tabla completa en el README. | RV | §11 |
 | RNF-03 | **Disponibilidad**: una recarga durante un `wrk` en curso no produce errores de socket ni 5xx. | M | `wrk` + recargas repetidas → 0 errores. | BM | §8 |
 | RNF-04 | **No bloqueo**: ninguna llamada bloqueante en el hilo del event loop (DNS, disco, health). | M | Revisión de código. | RV | §3 |
-| RNF-05 | **Memoria acotada**: buffers de 16 KB de un `buffer_pool` (`mmap` + freelist); los cuerpos no se almacenan enteros. | M | Memoria RSS estable durante el benchmark y con cuerpos de 10 MB. | IT, BM | §6.2 |
-| RNF-06 | **Robustez**: sin fugas ni UB; los tests pasan con ASan/UBSan. | M | `meson test` con `-Db_sanitize=address,undefined` en verde. | UT, IT | §2 |
+| RNF-05 | **Memoria acotada**: buffers de 16 KB de un pool por hilo; los cuerpos no se almacenan enteros. | M | Memoria RSS estable durante el benchmark y con cuerpos de 10 MB. | IT, BM | §6.2 |
+| RNF-06 | **Robustez**: sin UB ni carreras de datos; sin `unsafe` en el camino de datos. | M | Código seguro de Rust (el compilador descarta UB y carreras); `unsafe` solo en las llamadas al sistema del master, revisado. | RV, UT, IT | §2 |
 | RNF-07 | **Seguridad**: protección frente a request smuggling y cabeceras sobredimensionadas. | M | RF-31 y RF-34 verificados. | UT | §6.1 |
-| RNF-08 | **Portabilidad**: compila y pasa los tests en Linux y macOS. | M | `meson test` verde en ambas. | UT, IT | §2 |
-| RNF-09 | **Calidad de código**: C11, sin warnings con `-Wall -Wextra -Wpedantic`, módulos según la tabla del README. | M | Build limpio. | RV | §2 |
-| RNF-10 | **Build**: Meson como único sistema de build; dependencias OpenSSL ≥ 3.0, tomlc99 (wrap) y cmocka. | M | `meson setup build && meson compile -C build` desde cero. | RV | §2 |
+| RNF-08 | **Portabilidad**: compila y pasa los tests en Linux y macOS. | M | `cargo test` y la batería de integración en verde en ambas. | UT, IT | §2 |
+| RNF-09 | **Calidad de código**: Rust, sin avisos de `rustc` ni de `cargo clippy`, formateado con `cargo fmt`, módulos según la tabla del README. | M | Build y clippy limpios. | RV | §2 |
+| RNF-10 | **Build**: cargo como único sistema de build; dependencias en `Cargo.toml`. | M | `cargo build` desde cero. | RV | §2 |
 
 ---
 
@@ -132,7 +136,7 @@ integración, **BM** = benchmark, **RV** = revisión de código/documentación.
 
 | ID | Entregable | Prio. |
 |---|---|---|
-| EN-01 | Código fuente + `meson.build` | M |
+| EN-01 | Código fuente + `Cargo.toml` | M |
 | EN-02 | Tests unitarios e integración en verde | M |
 | EN-03 | `SPEC.md`, `docs/requerimientos.md` y `README.md` con resultados reales del benchmark | M |
 | EN-04 | Configuración de ejemplo (`proxy.toml`) | M |
@@ -151,8 +155,8 @@ integración, **BM** = benchmark, **RV** = revisión de código/documentación.
 | n salidas por entrada según dominio | RF-20, RF-21 |
 | Round robin o balanceo por indicadores de carga | RF-50 – RF-59 |
 | Keep-alive HTTP/1.1 | RF-38 – RF-40 |
-| Proyecto con Meson | RNF-10 |
+| Proyecto con Meson | RNF-10 (sustituido por cargo en el port a Rust) |
 | Recarga automática de la configuración | RF-62 – RF-66 |
 | Test: generar config, lanzar servidores, `/etc/hosts` | RF-80 – RF-84 |
 | Benchmark 50.000 req/s | RNF-01 – RNF-03 |
-| Backend de prueba en C con kqueue | RF-80, RF-81 |
+| Backend de prueba en C con kqueue | RF-80, RF-81 (backend de prueba en Rust sobre mio/kqueue en el port) |

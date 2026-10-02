@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Tests de integración del proxy.
 #
-#   tests/integration/run.sh [directorio_build]
+#   tests/integration/run.sh [directorio_de_binarios]   (por defecto target/debug)
 #
 # 1. Genera configuración + CA/certificados (tests/gen_config.sh)
 # 2. Lanza los test_backend y el proxy
@@ -10,10 +10,10 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-BUILD=$(cd "${1:-$ROOT/build}" && pwd)
-PROXY=$BUILD/src/proxy
-BACKEND=$BUILD/tools/test_backend
-WS=$BUILD/tools/ws_probe
+BUILD=$(cd "${1:-$ROOT/target/debug}" && pwd)
+PROXY=$BUILD/proxy
+BACKEND=$BUILD/test_backend
+WS=$BUILD/ws_probe
 B=${PORT_BASE:-21000}
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/proxy-it.XXXXXX")
 HTTP=$((B + 80))
@@ -87,7 +87,7 @@ nth() { echo "$1" | tr ' ' '\n' | grep "^$2=" | cut -d= -f2 | grep . || echo 0; 
 # ------------------------------------------------------------------
 section "preparación"
 for bin in "$PROXY" "$BACKEND" "$WS"; do
-    [[ -x $bin ]] || { echo "falta $bin (¿meson compile -C build?)"; exit 1; }
+    [[ -x $bin ]] || { echo "falta $bin (¿cargo build?)"; exit 1; }
 done
 for t in curl jq socat openssl; do
     command -v $t >/dev/null || { echo "falta la herramienta '$t'"; exit 1; }
@@ -320,6 +320,17 @@ check "workers como hilos: sin procesos hijos" eq "$(pgrep -P "$PROXY_PID" | wc 
 wthreads=$(cat /proc/"$PROXY_PID"/task/*/comm 2>/dev/null | grep -c '^proxy-w[0-9]')
 check "un hilo proxy-wN por worker ($wthreads)" eq "$wthreads" "${WORKERS:-2}"
 check "stats: ningún worker relanzado"        eq "$(stat .worker_restarts)" 0
+if [[ $BUILD == */debug ]]; then
+    # Solo en builds de depuración: SIGUSR1 provoca un pánico en un worker.
+    kill -USR1 "$PROXY_PID"
+    check "worker con pánico es relanzado"     wait_until 3 bash -c "(( \$(socat - UNIX-CONNECT:$WORK/proxy.sock | jq .worker_restarts) >= 1 && \$(socat - UNIX-CONNECT:$WORK/proxy.sock | jq .workers_alive) == ${WORKERS:-2} ))"
+    check "el pánico queda en el log"          grep -q "terminó por un pánico" "$WORK/proxy.log"
+    errs=0
+    for i in $(seq 20); do [[ $(code api.test /) == 200 ]] || errs=$((errs + 1)); done
+    check "tráfico normal tras relanzar el worker" eq "$errs" 0
+    wthreads=$(cat /proc/"$PROXY_PID"/task/*/comm 2>/dev/null | grep -c '^proxy-w[0-9]')
+    check "sigue habiendo un hilo por worker ($wthreads)" eq "$wthreads" "${WORKERS:-2}"
+fi
 
 if command -v wrk >/dev/null; then
     section "carga + recargas sin errores (RNF-03)"
