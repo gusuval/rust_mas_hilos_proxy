@@ -14,9 +14,9 @@
     <div class="sub">Guía práctica para compilar, configurar, poner en marcha, supervisar y diagnosticar el proxy.</div>
   </div>
   <div class="meta">
-    <b>Versión</b><span>1.0.0</span>
-    <b>Fecha</b><span>26 de septiembre de 2026</span>
-    <b>Binario</b><span><code>build/src/proxy</code></span>
+    <b>Versión</b><span>2.0.0 (Rust)</span>
+    <b>Fecha</b><span>1 de octubre de 2026</span>
+    <b>Binario</b><span><code>target/release/proxy</code></span>
     <b>Referencia</b><span><code>proxy.toml</code> (comentado) · <code>SPEC.md</code></span>
   </div>
 </section>
@@ -37,6 +37,7 @@
     <li>Supervisión: estadísticas y logs</li>
     <li>Resolución de problemas</li>
     <li>Herramientas de prueba y benchmark</li>
+    <li>Rendimiento y comparativas</li>
   </ol>
 </section>
 
@@ -52,31 +53,29 @@
   <li><strong>Recarga sin cortes</strong>: basta con guardar el fichero de configuración.</li>
   <li>HTTP/1.1 completo: conexiones persistentes, pipelining, subidas grandes y WebSocket.</li>
 </ul>
-<div class="note"><p>Plataformas: <strong>Linux</strong> (verificado). macOS y BSD están soportados en el código, pero aún no se han probado en esas plataformas. Windows no está soportado.</p></div>
+<div class="note"><p>Plataformas: <strong>Linux</strong> (verificado). macOS y BSD están contemplados en el código, pero aún no se han compilado ni probado en esas plataformas. Windows no está soportado.</p></div>
+<p>Esta es la versión 2.0, escrita en <strong>Rust</strong>. Se configura y se maneja exactamente igual que las versiones anteriores en C: el mismo fichero de configuración, las mismas opciones, las mismas señales y las mismas estadísticas.</p>
 
 <!-- ============================================================ -->
 <h2>Instalación</h2>
 <h3>Requisitos</h3>
 <table>
   <tr><th>Para</th><th>Necesitas</th></tr>
-  <tr><td>Compilar</td><td>Compilador C11 (gcc o clang), Meson ≥ 0.60, Ninja, pkg-config, OpenSSL ≥ 3.0 (cabeceras)</td></tr>
-  <tr><td>Tests unitarios</td><td>cmocka</td></tr>
+  <tr><td>Compilar</td><td>Rust estable con edición 2024 (probado con 1.98), con <code>cargo</code>. Para el proveedor TLS por defecto (<code>aws-lc-rs</code>): compilador de C y <code>cmake</code></td></tr>
   <tr><td>Tests de integración</td><td>curl, jq, socat, openssl</td></tr>
   <tr><td>Benchmark</td><td>wrk</td></tr>
 </table>
-<p>En Ubuntu/Debian:</p>
-<pre><code>sudo apt-get install build-essential meson ninja-build pkg-config libssl-dev \
-                     libcmocka-dev curl jq socat wrk</code></pre>
-<p>En macOS (Homebrew): <code>brew install meson ninja pkg-config openssl@3 cmocka wrk jq socat</code>.</p>
+<p>Rust se instala con <a href="https://rustup.rs">rustup</a>. El resto, en Ubuntu/Debian:</p>
+<pre><code>curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+sudo apt-get install build-essential cmake curl jq socat openssl wrk</code></pre>
+<p>En macOS (Homebrew): <code>brew install cmake wrk jq socat</code>. Sin <code>cmake</code> se puede compilar con el proveedor <code>ring</code>: <code>cargo build --release --no-default-features -F ring</code>.</p>
 
 <h3>Compilar</h3>
-<pre><code>meson setup build
-meson compile -C build
-meson test -C build --suite unit     <span class="c"># opcional: 5 suites de tests</span></code></pre>
-<p>Se generan tres programas: <code>build/src/proxy</code> (el proxy), <code>build/tools/test_backend</code> (servidor de pruebas) y <code>build/tools/ws_probe</code> (cliente WebSocket de pruebas). Para producción, compila en modo release:</p>
-<pre><code>meson setup build-release -Dbuildtype=release -Db_lto=true
-meson compile -C build-release
-sudo meson install -C build-release   <span class="c"># instala 'proxy' en /usr/local/bin</span></code></pre>
+<pre><code>cargo build --release
+cargo test                    <span class="c"># opcional: 43 tests unitarios</span></code></pre>
+<p>Se generan tres programas en <code>target/release/</code>: <code>proxy</code> (el proxy), <code>test_backend</code> (servidor de pruebas) y <code>ws_probe</code> (cliente WebSocket de pruebas). El perfil release ya activa LTO. Para instalar el proxy:</p>
+<pre><code>cargo install --path . --bin proxy    <span class="c"># instala 'proxy' en ~/.cargo/bin</span>
+sudo install -m 755 target/release/proxy /usr/local/bin/   <span class="c"># o a mano</span></code></pre>
 
 <!-- ============================================================ -->
 <h2>Primeros pasos (demo en 5 minutos)</h2>
@@ -85,12 +84,12 @@ sudo meson install -C build-release   <span class="c"># instala 'proxy' en /usr/
 ./tests/gen_config.sh demo
 
 <span class="c"># 2. Unos servidores de ejemplo</span>
-./build/tools/test_backend --port 19001 --name api-1 &amp;
-./build/tools/test_backend --port 19002 --name api-2 &amp;
-./build/tools/test_backend --port 19004 --name web-1 &amp;
+./target/release/test_backend --port 19001 --name api-1 &amp;
+./target/release/test_backend --port 19002 --name api-2 &amp;
+./target/release/test_backend --port 19004 --name web-1 &amp;
 
 <span class="c"># 3. El proxy</span>
-./build/src/proxy -c demo/proxy.toml</code></pre>
+./target/release/proxy -c demo/proxy.toml</code></pre>
 <p>En otra terminal:</p>
 <pre><code>curl -H 'Host: api.test' http://127.0.0.1:18080/
 <span class="c">hello from api-1 path=/                  (+ una línea de relleno hasta 100 B)</span>
@@ -111,16 +110,16 @@ curl --cacert demo/certs/ca.pem --resolve api.test:18443:127.0.0.1 https://api.t
   -t  solo valida la configuración y sale
   -w  fuerza el número de workers</code></pre>
 <p>Valida siempre antes de desplegar:</p>
-<pre><code>$ ./build/src/proxy -t -c demo/proxy.toml
+<pre><code>$ ./target/release/proxy -t -c demo/proxy.toml
 configuración OK: 3 frontends, 8 backends, 2 workers</code></pre>
-<p>El proxy arranca un proceso <strong>master</strong> y N procesos <strong>worker</strong>. Las señales van siempre al master:</p>
+<p>El proxy es un único proceso con un hilo <strong>master</strong> y N hilos <strong>worker</strong> (<code>proxy-w0</code>, <code>proxy-w1</code>…, visibles con <code>top -H</code>). Las señales se envían al proceso y las atiende el master:</p>
 <table>
   <tr><th>Señal</th><th>Efecto</th></tr>
   <tr><td><code>SIGHUP</code></td><td>Recarga la configuración (también se recarga sola al guardar el fichero)</td></tr>
   <tr><td><code>SIGTERM</code>, <code>SIGINT</code></td><td>Parada ordenada: deja de aceptar conexiones y espera hasta 10 s a las peticiones en curso</td></tr>
 </table>
-<pre><code>kill -HUP $(pgrep -o -f 'proxy -c')      <span class="c"># -o: el más antiguo = master</span></code></pre>
-<p>Si un worker muere, el master lo relanza automáticamente.</p>
+<pre><code>kill -HUP $(pgrep -f 'proxy -c')</code></pre>
+<p>Si un worker termina por un error interno (un <code>panic</code>), solo cae ese hilo: el master lo relanza automáticamente y el resto sigue atendiendo tráfico. Queda registrado en el log (<code>worker N terminó por un pánico</code>) y en <code>worker_restarts</code> de las estadísticas.</p>
 
 <!-- ============================================================ -->
 <h2>Referencia de configuración</h2>
@@ -129,7 +128,7 @@ configuración OK: 3 frontends, 8 backends, 2 workers</code></pre>
 <h3>[global]</h3>
 <table>
   <tr><th>Clave</th><th>Tipo</th><th>Por defecto</th><th>Descripción</th></tr>
-  <tr><td><code>workers</code></td><td>"auto" o 1-128</td><td>"auto"</td><td>Procesos worker; "auto" = nº de CPUs. Cambiarlo requiere reiniciar</td></tr>
+  <tr><td><code>workers</code></td><td>"auto" o 1-128</td><td>"auto"</td><td>Hilos worker; "auto" = nº de CPUs. Cambiarlo requiere reiniciar</td></tr>
   <tr><td><code>stats_socket</code></td><td>ruta</td><td>/tmp/proxy.sock</td><td>Socket UNIX de estadísticas (máx. 107 caracteres)</td></tr>
   <tr><td><code>log_file</code></td><td>ruta</td><td>stderr</td><td>Fichero de log; "-" = stderr</td></tr>
   <tr><td><code>log_level</code></td><td>texto</td><td>"info"</td><td>debug · info · warn · error</td></tr>
@@ -223,7 +222,7 @@ certs  = [
 default_cert = 0</code></pre>
 <ul>
   <li><code>cert</code>: certificado en PEM; puede incluir la cadena intermedia a continuación.</li>
-  <li><code>key</code>: clave privada en PEM, sin contraseña. Se comprueba que corresponde al certificado.</li>
+  <li><code>key</code>: clave privada en PEM (PKCS#8, PKCS#1 o SEC1), sin contraseña. Se comprueba que corresponde al certificado.</li>
   <li>En <code>sni</code>, el comodín cubre una sola etiqueta (<code>*.example.com</code> no vale para <code>a.b.example.com</code>), igual que en los certificados reales.</li>
 </ul>
 <p>Si el cliente pide por SNI un nombre y luego envía un <code>Host</code> distinto que su certificado no cubre, recibe <strong>421 Misdirected Request</strong>.</p>
@@ -273,7 +272,7 @@ X-Backend-Load: 0.37</code></pre>
 </ul>
 <pre><code>[info]  [master] configuración recargada (cambio en fichero)
 [error] [master] recarga rechazada, se mantiene la configuración actual:
-                 TOML inválido: line 133: syntax error</code></pre>
+                 TOML inválido: TOML parse error at line 136, column 6 …</code></pre>
 
 <!-- ============================================================ -->
 <h2>Supervisión: estadísticas y logs</h2>
@@ -301,7 +300,7 @@ X-Backend-Load: 0.37</code></pre>
   <tr><td><code>log_dropped</code></td><td>Mensajes de log descartados porque el disco no daba abasto</td></tr>
 </table>
 <h3>Logs</h3>
-<p>Formato: <code>fecha [nivel] [proceso] mensaje</code>. El proceso es <code>master</code> o <code>wN</code>. Cada petición genera una línea de acceso:</p>
+<p>Formato: <code>fecha [nivel] [hilo] mensaje</code>. El hilo es <code>master</code> o <code>wN</code> (los mensajes de las sondas de salud de un worker llevan también su <code>wN</code>). Cada petición genera una línea de acceso:</p>
 <pre><code>2026-09-26T23:12:47.184Z [access] [w0] 127.0.0.1 api.test "GET /hola" 200 127.0.0.1:19001 1ms
                                         │         │         │           │   │               └ latencia
                                         │         │         │           │   └ servidor que respondió
@@ -328,6 +327,8 @@ X-Backend-Load: 0.37</code></pre>
   <tr><td><strong>504</strong></td><td>El backend tardó más que <code>upstream_read</code></td><td>Sube el timeout o investiga el backend</td></tr>
   <tr><td><strong>408</strong></td><td>El cliente no terminó de enviar la cabecera a tiempo</td><td>Normal con clientes lentos o escáneres; ajusta <code>client_header</code></td></tr>
   <tr><td>Un cambio de config no se aplica</td><td>La recarga se rechazó</td><td>Busca <code>recarga rechazada</code> en el log; <code>reloads_failed</code> en las estadísticas</td></tr>
+  <tr><td><code>worker_restarts</code> &gt; 0</td><td>Un worker terminó por un error interno y se relanzó</td><td>Busca <code>terminó por un pánico</code> en el log y el mensaje del pánico en la salida de errores (stderr)</td></tr>
+  <tr><td>No compila: falta <code>cmake</code></td><td>El proveedor TLS <code>aws-lc-rs</code> lo necesita</td><td>Instala <code>cmake</code> o compila con <code>--no-default-features -F ring</code></td></tr>
 </table>
 
 <!-- ============================================================ -->
@@ -351,13 +352,33 @@ X-Backend-Load: 0.37</code></pre>
 <pre><code>ws_probe --host api.test 127.0.0.1 18080 /ws "hola"
 ws_probe --tls --ca demo/certs/ca.pem --sni api.test 127.0.0.1 18443 /ws "hola"</code></pre>
 <h3>Tests automáticos</h3>
-<pre><code>meson test -C build --suite unit   <span class="c"># 31 tests unitarios</span>
-./tests/integration/run.sh         <span class="c"># 96 comprobaciones de extremo a extremo (~20 s)</span></code></pre>
-<p>El script de integración genera su propia configuración, lanza 12 servidores y el proxy, comprueba todas las funcionalidades y lo limpia todo al terminar. <code>PORT_BASE=N</code> cambia los puertos y <code>KEEP_WORK=1</code> conserva los ficheros para inspeccionarlos.</p>
+<pre><code>cargo test                                  <span class="c"># 43 tests unitarios</span>
+./tests/integration/run.sh                  <span class="c"># 103 comprobaciones de extremo a extremo (~20 s)</span>
+./tests/integration/run.sh target/release   <span class="c"># 99 con el build release</span>
+cargo test -- --ignored                     <span class="c"># la batería de integración desde cargo</span></code></pre>
+<p>El script de integración genera su propia configuración, lanza 12 servidores y el proxy, comprueba todas las funcionalidades y lo limpia todo al terminar. Con el build de depuración comprueba además que un worker que entra en pánico (se provoca con <code>SIGUSR1</code>, solo en depuración) se relanza sin cortar el tráfico. <code>PORT_BASE=N</code> cambia los puertos y <code>KEEP_WORK=1</code> conserva los ficheros para inspeccionarlos.</p>
 <h3>Benchmark</h3>
 <pre><code>./bench/bench_proxy.sh                           <span class="c"># 30 s por escenario</span>
 DURATION=10s WORKERS=4 ./bench/bench_proxy.sh    <span class="c"># variante rápida</span></code></pre>
-<p>El script compila en release, reparte CPUs entre wrk, el proxy y los backends, y deja un informe en <code>bench/results/</code>. Resultado de referencia (8 workers, WSL2, Ryzen 7 7735HS): <strong>223.705 req/s por HTTPS</strong> con 100 conexiones y 337.904 por HTTP, sin errores.</p>
+<p>El script compila en release, reparte CPUs entre wrk, el proxy y los backends, y deja un informe en <code>bench/results/</code>. Con <code>PROXY_BIN</code> y <code>BACKEND_BIN</code> se pueden medir otros binarios, por ejemplo los de la versión en C, para comparar:</p>
+<pre><code>BACKEND_BIN=../version_pthread_proxy/build-release/tools/test_backend ./bench/bench_proxy.sh</code></pre>
+
+<!-- ============================================================ -->
+<h2>Rendimiento y comparativas</h2>
+<p>Resultados de referencia (8 workers, WSL2, Ryzen 7 7735HS de 16 hilos, respuesta de 100 B, 30 s por escenario, 0 errores en todos los casos). La meta del proyecto es 50.000 req/s por HTTPS.</p>
+<table>
+  <tr><th>Escenario</th><th class="n">C, procesos</th><th class="n">C, hilos</th><th class="n">Rust, backend C</th><th class="n">Rust (esta versión)</th></tr>
+  <tr><td>HTTPS, 100 conexiones</td><td class="n">223.372</td><td class="n">227.498</td><td class="n">203.985</td><td class="n"><strong>201.662</strong></td></tr>
+  <tr><td>HTTPS, 200 conexiones</td><td class="n">210.342</td><td class="n">215.434</td><td class="n">197.585</td><td class="n"><strong>191.660</strong></td></tr>
+  <tr><td>HTTPS, 400 conexiones</td><td class="n">173.506</td><td class="n">173.364</td><td class="n">162.959</td><td class="n"><strong>163.457</strong></td></tr>
+  <tr><td>HTTP, 200 conexiones</td><td class="n">307.471</td><td class="n">341.468</td><td class="n">365.279</td><td class="n"><strong>338.261</strong></td></tr>
+</table>
+<p>Medias de 2-3 ejecuciones por versión (la columna "Rust, backend C" es una sola ejecución); el detalle está en la documentación técnica, capítulo 12, y en <code>bench/results/</code>.</p>
+<ul>
+  <li><strong>Procesos frente a hilos (C)</strong>: mismo rendimiento en HTTPS; en HTTP los hilos dan un 6-13 % más.</li>
+  <li><strong>Rust frente a C</strong>: en HTTP, con el mismo backend, Rust iguala o supera a C. En HTTPS queda un ~10 % por debajo por la librería TLS (rustls frente a OpenSSL), no por el proxy.</li>
+  <li>Todas las versiones superan la meta más de 3 veces. Para sacar el máximo en tu máquina: build release, <code>access_log = false</code>, <code>log_level = "warn"</code> y <code>workers</code> igual al número de núcleos que dediques al proxy.</li>
+</ul>
 
 </body>
 </html>

@@ -75,7 +75,13 @@ Herramientas de prueba (`src/bin/`): `test_backend` (backend HTTP/1.1 + WebSocke
 
 Las decisiones de diseño, con sus alternativas, están en [`docs/decisiones.md`](docs/decisiones.md). La trazabilidad requerimiento → test está en [`docs/verificacion.md`](docs/verificacion.md).
 
-**Documentación de la versión C** (arquitectura y protocolos siguen valiendo; los detalles de implementación son de C): [documentación técnica (PDF)](docs/pdf/documentacion-tecnica.pdf), [manual de usuario (PDF)](docs/pdf/manual-de-usuario.pdf), [presentación (PPTX)](docs/presentacion/proxy-l7.pptx), [resumen de la sesión](docs/Resumen.md).
+**Documentación completa** (versión Rust, con las comparativas de todas las ejecuciones de benchmark):
+- [Documentación técnica (PDF)](docs/pdf/documentacion-tecnica.pdf): arquitectura, módulos, protocolos, pruebas, rendimiento y comparativas fork/pthread/Rust.
+- [Manual de usuario (PDF)](docs/pdf/manual-de-usuario.pdf): instalación, configuración, operación, resolución de problemas y rendimiento.
+- [Presentación (PPTX)](docs/presentacion/proxy-l7.pptx): evolución del proyecto, decisiones técnicas, benchmark, comparativas y coste.
+- [Resumen de la primera sesión (versión C)](docs/Resumen.md).
+
+Los fuentes de los PDF están en `docs/pdf/src/` (HTML + CSS de impresión, renderizados con Chrome headless: `google-chrome --headless --no-pdf-header-footer --print-to-pdf=…`) y la presentación se genera con `docs/presentacion/generar.mjs` (pptxgenjs).
 
 ## 📊 Benchmark (Linux, wrk, build release)
 
