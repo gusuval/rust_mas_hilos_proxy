@@ -1,5 +1,4 @@
-build/
-build-*/
+target/
 bench/results/*.txt
 *.log
 *.sock

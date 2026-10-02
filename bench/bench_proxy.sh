@@ -5,15 +5,17 @@
 #
 # Variables: DURATION (30s), WORKERS (nproc/2), BACKENDS (2),
 #            BACKEND_THREADS (2), PIN (1 = fijar CPUs con taskset),
-#            TARGET (50000), SCENARIOS ("100 200 400")
+#            TARGET (50000), SCENARIOS ("100 200 400"),
+#            PROXY_BIN / BACKEND_BIN (binarios alternativos, p. ej. los de
+#            la versión C para comparar)
 #
-# Compila en release (build-release/), genera certificados y config,
+# Compila en release (cargo build --release), genera certificados y config,
 # lanza BACKENDS test_backend y el proxy, y ejecuta wrk contra HTTPS
 # (obligatorio) y HTTP (informativo). Resultados en bench/results/.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BUILD=$ROOT/build-release
+BUILD=$ROOT/target/release
 DURATION=${DURATION:-30s}
 NCPU=$(nproc)
 WORKERS=${WORKERS:-$((NCPU / 2))}
@@ -28,10 +30,9 @@ PORT_HTTPS=38443
 
 command -v wrk >/dev/null || { echo "falta wrk"; exit 1; }
 
-if [[ ! -d $BUILD ]]; then
-    meson setup "$BUILD" "$ROOT" -Dbuildtype=release -Db_lto=true >/dev/null
-fi
-meson compile -C "$BUILD" >/dev/null
+(cd "$ROOT" && cargo build --release --bins -q)
+PROXY_BIN=${PROXY_BIN:-$BUILD/proxy}
+BACKEND_BIN=${BACKEND_BIN:-$BUILD/test_backend}
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/proxy-bench.XXXXXX")
 OUT=$ROOT/bench/results
@@ -95,11 +96,11 @@ servers  = [ ${SERVERS%, } ]
 TOML
 
 for i in $(seq "$BACKENDS"); do
-    $T_BACK "$BUILD/tools/test_backend" --port $((39000 + i)) --name "b$i" \
+    $T_BACK "$BACKEND_BIN" --port $((39000 + i)) --name "b$i" \
         --threads "$BACKEND_THREADS" 2>/dev/null &
     PIDS+=($!)
 done
-$T_PROXY "$BUILD/src/proxy" -c "$WORK/proxy.toml" 2>"$WORK/proxy.stderr" &
+$T_PROXY "$PROXY_BIN" -c "$WORK/proxy.toml" 2>"$WORK/proxy.stderr" &
 PIDS+=($!)
 sleep 1
 curl -sf -o /dev/null -H 'Host: bench.test' "http://127.0.0.1:$PORT_HTTP/" || { echo "el proxy no responde"; cat "$WORK/proxy.stderr"; exit 1; }
@@ -118,6 +119,8 @@ MEM=$(free -g 2>/dev/null | awk '/Mem:/{print $2" GB"}' || echo "?")
     echo "| Kernel | $(uname -sr) |"
     echo "| OpenSSL | $(openssl version | cut -d' ' -f2) |"
     echo "| Build | release + LTO |"
+    echo "| Proxy | \`${PROXY_BIN#"$ROOT"/}\` |"
+    echo "| Backend | \`${BACKEND_BIN#"$ROOT"/}\` |"
     echo "| Workers del proxy | $WORKERS |"
     echo "| Backends | $BACKENDS × test_backend ($BACKEND_THREADS hilos) |"
     echo "| Afinidad | $PINNING |"
